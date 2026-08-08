@@ -1,0 +1,57 @@
+flowchart TB
+    U([User query]) --> AG
+
+    subgraph APP[" Application "]
+        direction LR
+        AG["<b>agent.py</b><br/>MemoryAgent"]
+        MEM["<b>memory.py</b><br/>embed · write_memory · recall"]
+        AG <--> MEM
+    end
+
+    subgraph BR[" AWS Bedrock "]
+        direction LR
+        TITAN["<b>Titan Text v2</b><br/>1024-d embeddings"]
+        CLAUDE["<b>Claude</b><br/>converse API"]
+    end
+
+    subgraph CRDB[" CockroachDB Cloud "]
+        direction LR
+        REC[("<b>memory_records</b><br/>VECTOR(1024)<br/>distributed vector index")]
+        RET[("<b>memory_retrievals</b><br/>raw_candidates<br/>applied_floor · TTL 30d")]
+        TURNS[("<b>agent_turns</b><br/>FK → retrieval_id<br/>TTL 30d")]
+        CFG[("<b>agent_config</b><br/>per-agent floor")]
+        HEALTH[("<b>memory_health_events</b><br/>TTL 7d")]
+    end
+
+    subgraph SCHED[" Scheduled checks "]
+        direction LR
+        EVB["<b>EventBridge Scheduler</b><br/>rate(5 minutes)"] --> LAMBDA["<b>Lambda</b><br/>memory-health-checks<br/>5 checks"]
+    end
+
+    subgraph OBS[" Observability "]
+        direction LR
+        API["<b>api.py</b><br/>FastAPI"] --> DASH["<b>Memory Health</b><br/>dashboard"]
+    end
+
+    MEM -- "① embed query" --> TITAN
+    MEM -- "② ANN search" --> REC
+    MEM -- "③ log retrieval" --> RET
+    MEM -. "read floor" .-> CFG
+    AG -- "④ prompt + memories" --> CLAUDE
+    AG -- "⑤ record turn" --> TURNS
+    TURNS -. "traces to" .-> RET
+
+    LAMBDA -- "reads" --> CRDB
+    LAMBDA -- "writes verdicts" --> HEALTH
+    CRDB --> API
+
+    HARNESS["<b>demo_harness.py</b><br/>labeled, reversible<br/>failure injection"] -. "demo- rows only" .-> CRDB
+
+    classDef svc fill:#fff3e6,stroke:#d95926,stroke-width:1.5px,color:#3d1f0c
+    classDef db fill:#e8f1fd,stroke:#2a78d6,stroke-width:1.5px,color:#0d2947
+    classDef app fill:#f2f2f0,stroke:#52514e,stroke-width:1.5px,color:#1a1a19
+    classDef obs fill:#e9f6e9,stroke:#0ca30c,stroke-width:1.5px,color:#0a2e0a
+    class TITAN,CLAUDE,LAMBDA,EVB svc
+    class REC,RET,TURNS,CFG,HEALTH db
+    class AG,MEM,HARNESS app
+    class API,DASH obs
