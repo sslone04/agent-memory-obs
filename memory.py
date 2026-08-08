@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import json
 import os
+import pathlib
 import time
+import urllib.parse
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -42,10 +44,36 @@ def _bedrock_client():
     return _bedrock
 
 
+# Bundled CockroachDB CA (the public ISRG roots -- no private key).  Deployed
+# environments have no ~/.postgresql/root.crt, and sslrootcert=system does not
+# work: psycopg's bundled libpq cannot resolve the container trust store.
+BUNDLED_CA = pathlib.Path(__file__).resolve().parent / "certs" / "cockroachdb-root.crt"
+
+
 def _database_url() -> str:
+    """The connection string, with a resolvable CA path guaranteed.
+
+    Keeps sslmode=verify-full untouched -- this fills in *where* to find the
+    root cert, it never weakens verification.
+    """
     url = os.getenv("DATABASE_URL")
     if not url:
         raise RuntimeError("DATABASE_URL is not set (expected in .env)")
+
+    parsed = urllib.parse.urlparse(url)
+    query = urllib.parse.parse_qs(parsed.query)
+    if "sslrootcert" in query:
+        return url  # caller was explicit; respect it
+
+    default_ca = pathlib.Path.home() / ".postgresql" / "root.crt"
+    if default_ca.exists():
+        return url  # libpq's default location works here
+
+    if BUNDLED_CA.exists():
+        query["sslrootcert"] = [str(BUNDLED_CA)]
+        return urllib.parse.urlunparse(
+            parsed._replace(query=urllib.parse.urlencode(query, doseq=True))
+        )
     return url
 
 

@@ -62,6 +62,12 @@ for line in (root / ".env").read_text().splitlines():
         url = line.split("=", 1)[1].strip()
 if not url:
     raise SystemExit("DATABASE_URL not found in .env")
+# .env values are commonly quoted; libpq treats a leading quote as part of the
+# option name and fails with `invalid connection option`.
+if len(url) >= 2 and url[0] == url[-1] and url[0] in ("'", '"'):
+    url = url[1:-1]
+if not url.startswith(("postgres://", "postgresql://")):
+    raise SystemExit("DATABASE_URL does not look like a postgres connection string")
 p = urllib.parse.urlparse(url)
 q = urllib.parse.parse_qs(p.query)
 q["sslrootcert"] = ["/var/task/root.crt"]     # the CA we shipped in the zip

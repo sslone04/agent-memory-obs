@@ -8,9 +8,10 @@ disagree with the checker about what "warn" means.
 from __future__ import annotations
 
 import os
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 import psycopg
 from fastapi import FastAPI, Query
@@ -48,8 +49,24 @@ STATIC_DIR = Path(__file__).parent / "static"
 app = FastAPI(title="Agent Memory Health", docs_url="/api/docs")
 
 
-def _rows(sql: str, params: tuple = ()) -> list[dict[str, Any]]:
+@contextmanager
+def read_only_connect() -> Iterator[psycopg.Connection]:
+    """A connection the database itself refuses to let write.
+
+    This dashboard is deployed publicly, so "we only wrote SELECTs" is not a
+    strong enough guarantee -- a future endpoint, or a bug, should not be able
+    to mutate the corpus it is supposed to be observing.  Setting the session
+    read-only pushes the guarantee down to CockroachDB, which rejects any
+    INSERT/UPDATE/DELETE/DDL regardless of what this process asks for.
+    """
     with connect() as conn:
+        conn.autocommit = True
+        conn.execute("SET default_transaction_read_only = on")
+        yield conn
+
+
+def _rows(sql: str, params: tuple = ()) -> list[dict[str, Any]]:
+    with read_only_connect() as conn:
         with conn.cursor() as cur:
             cur.execute(sql, params)
             return cur.fetchall()
@@ -549,6 +566,19 @@ def agent_impact(
         "band": NEAR_MISS_BAND,
         "blind": rows,
     }
+
+
+@app.get("/healthz")
+def healthz() -> dict[str, str]:
+    """Liveness only -- deliberately does not touch the database.
+
+    This answers "is the web process up", which is what a platform health
+    check needs. Whether the *memory* is healthy is a different question with
+    a different answer, and /api/health/current is the honest one. Wiring a
+    platform restart to that endpoint would restart the service every time the
+    checker fell behind, which fixes nothing.
+    """
+    return {"status": "ok"}
 
 
 @app.get("/")

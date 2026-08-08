@@ -1,0 +1,33 @@
+# Render blueprint for the read-only Memory Health dashboard.
+#
+# Deploy: Render dashboard -> New -> Blueprint -> pick this repo.
+# Render reads this file; the only thing you set by hand is DATABASE_URL.
+#
+# What is deployed is the dashboard ONLY. checks.py runs on Lambda and
+# demo_harness.py runs locally -- neither is reachable from this service, and
+# api.py holds its database session read-only so the platform refuses writes
+# even if a future endpoint tried.
+services:
+  - type: web
+    name: agent-memory-health
+    runtime: python
+    plan: free
+    region: oregon
+
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn api:app --host 0.0.0.0 --port $PORT
+
+    # Liveness only. Deliberately NOT /api/health/current: that endpoint
+    # reports on the agent's memory, and wiring platform restarts to it would
+    # bounce the service every time the checker fell behind.
+    healthCheckPath: /healthz
+
+    envVars:
+      # sync: false means "prompt for this in the dashboard, never store it in
+      # the repo". Set it to the same CockroachDB connection string as .env.
+      # The CA is bundled at certs/cockroachdb-root.crt and resolved
+      # automatically, so no sslrootcert is needed here.
+      - key: DATABASE_URL
+        sync: false
+      - key: PYTHON_VERSION
+        value: "3.12.2"

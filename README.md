@@ -8,6 +8,35 @@ a schedule, and a dashboard that refuses to say "healthy" unless it has evidence
 
 ---
 
+## Live demo
+
+**Dashboard:** _<!-- PASTE RENDER URL HERE after the first deploy, e.g. https://agent-memory-health.onrender.com -->_
+
+The deployed dashboard is **read-only**. Every route is `GET`, and `api.py`
+holds its database session `read_only`, so CockroachDB refuses any write, DDL
+included — the injection and reset verbs in `demo_harness.py` are local-only and
+are not reachable from the web service.
+
+Two things to expect on a free-tier instance: the first request after ~15
+minutes of inactivity takes **up to a minute** while the service cold-starts,
+and the overall verdict reads whatever the memory *actually* is — it is wired
+to real data and is frequently not green.
+
+<details>
+<summary>Deploying it yourself</summary>
+
+The repo ships a `render.yaml` blueprint. In Render: **New → Blueprint →**
+select this repo. The only thing to set by hand is `DATABASE_URL` (marked
+`sync: false`, so it is never stored in the repo). The CockroachDB CA is
+bundled at `certs/cockroachdb-root.crt` and resolved automatically, because a
+deployed container has no `~/.postgresql/root.crt`.
+
+`healthCheckPath` points at `/healthz` — liveness only, deliberately not
+`/api/health/current`. Wiring platform restarts to the memory-health endpoint
+would bounce the service every time the checker fell behind, which fixes
+nothing.
+</details>
+
 ## The problem
 
 When a database goes down you get an exception. When agent memory degrades you
