@@ -28,7 +28,8 @@ EMBED_MODEL_ID = "amazon.titan-embed-text-v2:0"
 EMBED_DIM = 1024  # must match memory_records.embedding VECTOR(1024)
 AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
 
-# Cosine floor a candidate must clear to be handed back to the caller.
+# Cosine floor a candidate must clear to be handed back to the caller.  This is
+# the fallback only -- the effective floor comes from agent_config, per agent.
 DEFAULT_MIN_SIMILARITY = 0.35
 
 _bedrock = None
@@ -63,6 +64,49 @@ def _to_vector(values: Sequence[float]) -> str:
 def _similarity(l2_distance: float) -> float:
     """Titan v2 vectors are unit-normalized, so cosine = 1 - d^2 / 2."""
     return 1.0 - (l2_distance * l2_distance) / 2.0
+
+
+def get_floor(agent_id: str, conn: psycopg.Connection | None = None) -> float:
+    """The similarity floor in force for this agent.
+
+    Falls back to DEFAULT_MIN_SIMILARITY when the agent has no config row, so
+    an unconfigured agent behaves exactly as it did before agent_config existed.
+    """
+
+    def _run(c: psycopg.Connection) -> float:
+        with c.cursor() as cur:
+            cur.execute(
+                "SELECT min_similarity FROM agent_config WHERE agent_id = %s", (agent_id,)
+            )
+            row = cur.fetchone()
+        return float(row["min_similarity"]) if row else DEFAULT_MIN_SIMILARITY
+
+    if conn is not None:
+        return _run(conn)
+    with connect() as owned:
+        return _run(owned)
+
+
+def set_floor(
+    agent_id: str, min_similarity: float, conn: psycopg.Connection | None = None
+) -> None:
+    """Set (or change) one agent's retrieval floor."""
+
+    def _run(c: psycopg.Connection) -> None:
+        with c.cursor() as cur:
+            cur.execute(
+                """
+                UPSERT INTO agent_config (agent_id, min_similarity, updated_at)
+                VALUES (%s, %s, now())
+                """,
+                (agent_id, float(min_similarity)),
+            )
+
+    if conn is not None:
+        _run(conn)
+        return
+    with connect() as owned:
+        _run(owned)
 
 
 def embed(text: str) -> list[float]:
@@ -135,26 +179,39 @@ def recall(
     *,
     session_id: str,
     limit: int = 5,
-    min_similarity: float = DEFAULT_MIN_SIMILARITY,
+    min_similarity: float | None = None,
     include_expired: bool = False,
+    stats: dict[str, Any] | None = None,
     conn: psycopg.Connection | None = None,
 ) -> list[dict[str, Any]]:
     """Nearest-neighbour search over one agent's memories, floored.
 
     The vector search returns the `limit` nearest rows whatever their scores, so
-    anything below `min_similarity` is dropped before the caller sees it.  Both
-    counts are logged: `raw_candidates` pre-filter, `results_returned` post.  A
-    widening gap between them is the degradation signal -- the search is still
-    finding rows, they are just getting worse.
+    anything below the floor is dropped before the caller sees it.  Both counts
+    are logged: `raw_candidates` pre-filter, `results_returned` post.  A widening
+    gap between them is the degradation signal -- the search is still finding
+    rows, they are just getting worse.
+
+    The floor comes from agent_config unless `min_similarity` is passed
+    explicitly.  Whichever value applied is written to `applied_floor` on the
+    retrieval row: changing an agent's floor must not silently rewrite what
+    every past row meant.
 
     Always writes a memory_retrievals row, including when the filtered result is
     empty.  `top_similarity` is the best *pre-filter* score, so a retrieval that
     floors out still records how close it came.  Only rows that survive the
     floor have their access counters bumped.
+
+    Pass a dict as `stats` to receive the telemetry for this call (retrieval id,
+    top_similarity, raw_candidates, applied_floor).  A floored-out retrieval
+    returns [], so without this there is no way for a caller to learn how close
+    it came -- and the retrieval row cannot be found again by timestamp, since
+    CockroachDB gives every row in a transaction the same now().
     """
 
     def _run(c: psycopg.Connection) -> list[dict[str, Any]]:
         started = time.perf_counter()
+        floor = min_similarity if min_similarity is not None else get_floor(agent_id, c)
         vector = _to_vector(embed(query_text))
         expiry_clause = "" if include_expired else "AND (expires_at IS NULL OR expires_at > now())"
         search_sql = f"""
@@ -178,7 +235,7 @@ def recall(
             # Best score before the floor -- kept even when nothing survives, so
             # a floored-out retrieval still says how near it got.
             top_similarity = candidates[0]["similarity"] if candidates else None
-            rows = [r for r in candidates if r["similarity"] >= min_similarity]
+            rows = [r for r in candidates if r["similarity"] >= floor]
 
             if rows:
                 cur.execute(
@@ -196,8 +253,9 @@ def recall(
                 """
                 INSERT INTO memory_retrievals
                     (agent_id, session_id, query_text, raw_candidates,
-                     results_returned, top_similarity, latency_ms)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                     results_returned, top_similarity, latency_ms, applied_floor)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING id
                 """,
                 (
                     agent_id,
@@ -207,7 +265,21 @@ def recall(
                     len(rows),
                     top_similarity,
                     latency_ms,
+                    floor,
                 ),
+            )
+            retrieval_id = cur.fetchone()["id"]
+
+        if stats is not None:
+            stats.update(
+                {
+                    "retrieval_id": retrieval_id,
+                    "top_similarity": top_similarity,
+                    "raw_candidates": len(candidates),
+                    "results_returned": len(rows),
+                    "applied_floor": floor,
+                    "latency_ms": latency_ms,
+                }
             )
         return rows
 

@@ -5,7 +5,13 @@ Four independent checks, each writing one row to memory_health_events:
     staleness         -- rows that landed recently but carry an old as-of time
     eviction_pressure -- share of live rows about to expire
     empty_resolve     -- retrievals that found candidates but cleared none
+    near_miss         -- retrievals the floor probably discarded by mistake
     vector_drift      -- embeddings that are missing, mis-sized, or un-normalised
+
+empty_resolve and near_miss look at the same rows and mean opposite things.
+empty_resolve is a DATA problem: nothing relevant was there. near_miss is a
+CONFIG problem: something relevant was there and the floor rejected it. Keeping
+them separate is the point -- they have different fixes.
 
 Every check writes a row on every run, including when it finds nothing.  A
 missing health record means the checker did not run; it must never be readable
@@ -46,6 +52,16 @@ EMPTY_RESOLVE_WARN_PCT = 10.0
 EMPTY_RESOLVE_CRITICAL_PCT = 30.0
 # Below this many retrievals in the window, percentages are noise -- stay ok.
 EMPTY_RESOLVE_MIN_SAMPLE = 5
+
+# --- near miss / false negatives -------------------------------------------
+NEAR_MISS_WINDOW_MINUTES = 60
+# How far below the applied floor a score can sit and still be "probably relevant".
+NEAR_MISS_BAND = 0.15
+# Share OF FLOORED-OUT RETRIEVALS that are near misses, not share of all traffic.
+NEAR_MISS_WARN_PCT = 25.0
+NEAR_MISS_CRITICAL_PCT = 50.0
+# Below this many floored-out retrievals, a percentage means nothing.
+NEAR_MISS_MIN_SAMPLE = 3
 
 # --- vector drift ----------------------------------------------------------
 VECTOR_EXPECTED_DIM = EMBED_DIM
@@ -349,6 +365,186 @@ def check_empty_resolve(
     return _with_conn(_run, conn)
 
 
+def check_near_miss(
+    conn: psycopg.Connection | None = None,
+    *,
+    window_minutes: int = NEAR_MISS_WINDOW_MINUTES,
+    band: float = NEAR_MISS_BAND,
+) -> dict[str, Any]:
+    """Retrievals the floor probably threw away by mistake.
+
+    This is deliberately NOT empty_resolve.  empty_resolve says "nothing in the
+    corpus was relevant" -- a data problem, fixed by writing better memories.
+    near_miss says "something almost certainly WAS relevant and the retrieval
+    policy discarded it" -- a config problem, fixed by moving the floor.  A
+    retrieval scoring 0.34 against a 0.35 floor is a false negative; one
+    scoring 0.04 is a genuine miss.  Averaging them together hides both.
+    """
+
+    def _run(c: psycopg.Connection) -> dict[str, Any]:
+        floored_sql = """
+            WITH floored AS (
+                SELECT agent_id, query_text, top_similarity,
+                       coalesce(applied_floor, %s) AS floor
+                FROM memory_retrievals
+                WHERE extract(epoch FROM (now() - retrieved_at)) <= %s * 60
+                  AND results_returned = 0
+                  AND coalesce(raw_candidates, 0) > 0
+                  AND top_similarity IS NOT NULL
+            )
+        """
+        with c.cursor() as cur:
+            cur.execute(
+                floored_sql
+                + """
+                SELECT
+                    count(*) AS floored_total,
+                    count(*) FILTER (
+                        WHERE top_similarity >= floor - %s AND top_similarity < floor
+                    ) AS near_miss,
+                    count(*) FILTER (WHERE top_similarity < floor - %s) AS clear_miss,
+                    max(top_similarity) FILTER (
+                        WHERE top_similarity >= floor - %s AND top_similarity < floor
+                    ) AS max_near_miss,
+                    min(top_similarity) FILTER (
+                        WHERE top_similarity >= floor - %s AND top_similarity < floor
+                    ) AS min_near_miss,
+                    max(top_similarity) FILTER (WHERE top_similarity < floor - %s) AS max_clear_miss
+                FROM floored
+                """,
+                (DEFAULT_MIN_SIMILARITY, window_minutes, band, band, band, band, band),
+            )
+            totals = cur.fetchone()
+
+            cur.execute(
+                floored_sql
+                + """
+                SELECT top_similarity, floor, agent_id, query_text
+                FROM floored
+                WHERE top_similarity >= floor - %s AND top_similarity < floor
+                ORDER BY top_similarity DESC
+                LIMIT 100
+                """,
+                (DEFAULT_MIN_SIMILARITY, window_minutes, band),
+            )
+            near_rows = cur.fetchall()
+
+            cur.execute(
+                floored_sql
+                + """
+                SELECT agent_id, count(*) AS near_miss,
+                       max(top_similarity) AS best_rejected
+                FROM floored
+                WHERE top_similarity >= floor - %s AND top_similarity < floor
+                GROUP BY agent_id ORDER BY count(*) DESC LIMIT 1
+                """,
+                (DEFAULT_MIN_SIMILARITY, window_minutes, band),
+            )
+            worst = cur.fetchone()
+
+            cur.execute(
+                """
+                SELECT DISTINCT coalesce(applied_floor, %s) AS floor
+                FROM memory_retrievals
+                WHERE extract(epoch FROM (now() - retrieved_at)) <= %s * 60
+                ORDER BY 1
+                """,
+                (DEFAULT_MIN_SIMILARITY, window_minutes),
+            )
+            floors_seen = [round(float(r["floor"]), 4) for r in cur.fetchall()]
+
+        floored_total = totals["floored_total"] or 0
+        near_miss = totals["near_miss"] or 0
+        share = _pct(near_miss, floored_total)
+
+        if floored_total < NEAR_MISS_MIN_SAMPLE:
+            severity = "ok"
+        else:
+            severity = _severity(share, NEAR_MISS_WARN_PCT, NEAR_MISS_CRITICAL_PCT)
+
+        scores = [round(float(r["top_similarity"]), 4) for r in near_rows]
+        max_near = totals["max_near_miss"]
+        max_clear = totals["max_clear_miss"]
+
+        # A suggested floor only means something when both populations are
+        # present: the highest score we rejected as relevant, and the highest
+        # score we are confident was noise. The midpoint separates them.
+        suggested = None
+        suggestion_note = None
+        if near_miss == 0:
+            suggestion_note = "no near misses in the window -- nothing to suggest"
+        elif max_clear is None:
+            suggestion_note = (
+                "no clearly-off-topic retrievals in the window to separate from, "
+                "so a midpoint would be guesswork"
+            )
+        elif len(floors_seen) > 1:
+            suggested = round((float(max_near) + float(max_clear)) / 2, 4)
+            suggestion_note = (
+                f"multiple floors in force in this window ({floors_seen}); the "
+                "suggestion is an aggregate and should be applied per agent"
+            )
+        else:
+            suggested = round((float(max_near) + float(max_clear)) / 2, 4)
+            suggestion_note = (
+                f"midpoint between the best rejected-but-relevant score "
+                f"({float(max_near):.4f}) and the best clearly-off-topic score "
+                f"({float(max_clear):.4f})"
+            )
+
+        detail = {
+            "window_minutes": window_minutes,
+            "band": band,
+            "floors_in_force": floors_seen,
+            "floored_out_total": floored_total,
+            "near_miss": near_miss,
+            "near_miss_pct_of_floored": share,
+            "clear_miss": totals["clear_miss"] or 0,
+            "warn_pct": NEAR_MISS_WARN_PCT,
+            "critical_pct": NEAR_MISS_CRITICAL_PCT,
+            "min_sample": NEAR_MISS_MIN_SAMPLE,
+            "sample_too_small": floored_total < NEAR_MISS_MIN_SAMPLE,
+            "score_distribution": {
+                "near_miss_scores": scores,
+                "max_near_miss": round(float(max_near), 4) if max_near is not None else None,
+                "min_near_miss": (
+                    round(float(totals["min_near_miss"]), 4)
+                    if totals["min_near_miss"] is not None
+                    else None
+                ),
+                "max_clear_miss": round(float(max_clear), 4) if max_clear is not None else None,
+            },
+            # A suggestion, never applied automatically. Moving a retrieval floor
+            # changes what every future query returns; that is a human decision.
+            "suggested_floor": suggested,
+            "suggested_floor_is_advisory": True,
+            "suggestion_basis": suggestion_note,
+            "examples": [
+                {
+                    "agent_id": r["agent_id"],
+                    "query_text": r["query_text"],
+                    "top_similarity": round(float(r["top_similarity"]), 4),
+                    "floor": round(float(r["floor"]), 4),
+                }
+                for r in near_rows[:5]
+            ],
+            "worst_offender": (
+                {
+                    "agent_id": worst["agent_id"],
+                    "near_miss": worst["near_miss"],
+                    "best_rejected": round(float(worst["best_rejected"]), 4),
+                }
+                if worst
+                else None
+            ),
+        }
+        return _record(
+            c, "near_miss", severity, worst["agent_id"] if worst else None, detail
+        )
+
+    return _with_conn(_run, conn)
+
+
 def check_vector_drift(
     conn: psycopg.Connection | None = None,
     *,
@@ -436,6 +632,7 @@ CHECKS: tuple[Callable[..., dict[str, Any]], ...] = (
     check_staleness,
     check_eviction_pressure,
     check_empty_resolve,
+    check_near_miss,
     check_vector_drift,
 )
 
@@ -454,6 +651,33 @@ def worst_severity(results: list[dict[str, Any]]) -> str:
     if not results:
         return "ok"
     return max((r["severity"] for r in results), key=lambda s: SEVERITY_ORDER[s])
+
+
+def lambda_handler(event: Any = None, context: Any = None) -> dict[str, Any]:
+    """AWS Lambda entrypoint: run every check, return a JSON-safe summary.
+
+    Never logs DATABASE_URL or any part of the connection string.
+    """
+    results = run_all()
+    summary = {
+        "worst_severity": worst_severity(results),
+        "checks_run": len(results),
+        "checks": [
+            {
+                "check_name": r["check_name"],
+                "severity": r["severity"],
+                "agent_id": r["agent_id"],
+                "observed_at": r["observed_at"],
+                "detail": r["detail"],
+            }
+            for r in results
+        ],
+    }
+    for result in results:
+        print(f"{result['check_name']}: {result['severity']}")
+    print(f"worst_severity: {summary['worst_severity']}")
+    # default=str flattens UUIDs/datetimes so the return value stays JSON-safe
+    return json.loads(json.dumps(summary, default=str))
 
 
 def _print_human(results: list[dict[str, Any]]) -> None:

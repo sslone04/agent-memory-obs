@@ -21,13 +21,13 @@ CREATE TABLE memory_records (
 -- Health check results written by the Lambda checks
 CREATE TABLE memory_health_events (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    check_name STRING NOT NULL,        -- 'staleness' | 'eviction_pressure' | 'vector_drift' | 'empty_resolve'
+    check_name STRING NOT NULL,        -- 'staleness' | 'eviction_pressure' | 'vector_drift' | 'empty_resolve' | 'near_miss'
     severity STRING NOT NULL,          -- 'ok' | 'warn' | 'critical'
     agent_id STRING,
     detail JSONB NOT NULL,
     observed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     INDEX (check_name, observed_at DESC)
-);
+) WITH (ttl_expire_after = '7 days');   -- row-level TTL: the layer prunes itself
 
 -- Every retrieval attempt, so "resolved to empty" is detectable
 CREATE TABLE memory_retrievals (
@@ -39,7 +39,37 @@ CREATE TABLE memory_retrievals (
     top_similarity FLOAT,
     latency_ms INT,
     retrieved_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    raw_candidates INT,                -- candidates before the similarity floor
+    applied_floor FLOAT,               -- the floor THIS retrieval used, so a
+                                       -- config change never silently rewrites
+                                       -- what past rows meant
     INDEX (agent_id, retrieved_at DESC)
+) WITH (ttl_expire_after = '30 days');  -- row-level TTL: the layer prunes itself
+
+-- One row per agent turn, linked to the retrieval that fed it. This is what
+-- makes a bad answer traceable to the memory failure that caused it.
+CREATE TABLE agent_turns (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    agent_id STRING NOT NULL,
+    session_id STRING NOT NULL,
+    query STRING NOT NULL,
+    response STRING NOT NULL,
+    -- ON DELETE SET NULL, not CASCADE: memory_retrievals has a 30-day TTL, and
+    -- an expiring retrieval must not delete the record of what the agent said.
+    retrieval_id UUID REFERENCES memory_retrievals(id) ON DELETE SET NULL,
+    memories_used INT NOT NULL DEFAULT 0,
+    model_id STRING,
+    latency_ms INT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    INDEX (agent_id, created_at DESC),
+    INDEX (retrieval_id)
+) WITH (ttl_expire_after = '30 days');
+
+-- Per-agent retrieval policy. Absent row = DEFAULT_MIN_SIMILARITY.
+CREATE TABLE agent_config (
+    agent_id STRING PRIMARY KEY,
+    min_similarity FLOAT NOT NULL DEFAULT 0.35,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 CREATE VECTOR INDEX ON memory_records (embedding);
