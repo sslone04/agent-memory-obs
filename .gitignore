@@ -10,3 +10,6 @@ __pycache__/
 claude-session.jsonl
 claude-session-build.jsonl
 codex-session.jsonl
+
+# Grant application draft: contains payout wallet + personal contact details.
+grant_application/
