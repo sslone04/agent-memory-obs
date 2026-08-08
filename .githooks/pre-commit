@@ -1,0 +1,31 @@
+#!/bin/sh
+# Refuse to commit secrets or grant-application material, even if .gitignore
+# is edited or `git add -f` is used. Enable with:
+#     git config core.hooksPath .githooks
+set -e
+
+BLOCKED='(^|/)\.env$|(^|/)grant_application/|(^|/)[a-z-]*session[a-z-]*\.jsonl$|(^|/)\.aws/|(^|/)root\.crt$'
+
+staged=$(git diff --cached --name-only)
+offenders=$(printf '%s\n' "$staged" | grep -E "$BLOCKED" || true)
+
+if [ -n "$offenders" ]; then
+  echo "pre-commit: refusing to commit protected paths:" >&2
+  printf '  %s\n' $offenders >&2
+  echo "" >&2
+  echo "These contain secrets or personal/payout details and must never be public." >&2
+  echo "If this is a deliberate, reviewed exception: git commit --no-verify" >&2
+  exit 1
+fi
+
+# Catch a DATABASE_URL with an inline password pasted into any staged file.
+# Angle brackets are excluded from the userinfo character class so documentation
+# placeholders like <user>:<password>@host do not trip this; real credentials
+# cannot contain a literal < or > (they would be percent-encoded).
+if printf '%s\n' "$staged" | grep -q .; then
+  if git diff --cached -U0 | grep -nE '^\+.*postgres(ql)?://[^:@/<>[:space:]]+:[^@/<>[:space:]]+@' >/dev/null; then
+    echo "pre-commit: a connection string with an inline password is staged." >&2
+    echo "Move it to .env and reference os.environ['DATABASE_URL'] instead." >&2
+    exit 1
+  fi
+fi

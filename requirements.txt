@@ -1,0 +1,8 @@
+# Pinned to the versions this project was built and verified against.
+# Python 3.12 (3.11+ required; `X | None` unions and psycopg 3 typing).
+
+psycopg[binary]==3.3.4      # CockroachDB / PostgreSQL wire protocol
+boto3==1.43.67              # Bedrock: Titan embeddings + Claude via converse
+python-dotenv==1.2.2        # loads DATABASE_URL from .env
+fastapi==0.141.1            # dashboard backend
+uvicorn[standard]==0.52.1   # ASGI server for the dashboard
