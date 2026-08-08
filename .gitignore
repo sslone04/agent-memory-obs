@@ -1,0 +1,12 @@
+.env
+.venv/
+.claude/settings.local.json
+.claude/settings.local*.json
+__pycache__/
+*.pyc
+
+# Session transcripts: grant-application evidence, attached to the form directly.
+# Kept out of the public repo -- large, and raw conversation logs.
+claude-session.jsonl
+claude-session-build.jsonl
+codex-session.jsonl
