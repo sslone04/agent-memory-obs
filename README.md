@@ -10,17 +10,30 @@ a schedule, and a dashboard that refuses to say "healthy" unless it has evidence
 
 ## Live demo
 
-**Dashboard:** _<!-- PASTE RENDER URL HERE after the first deploy, e.g. https://agent-memory-health.onrender.com -->_
+**→ https://agent-memory-health.onrender.com**
 
 The deployed dashboard is **read-only**. Every route is `GET`, and `api.py`
 holds its database session `read_only`, so CockroachDB refuses any write, DDL
 included — the injection and reset verbs in `demo_harness.py` are local-only and
 are not reachable from the web service.
 
+**The failures shown there are injected on purpose.** The `demo-` agents are
+driven by `demo_harness.py`, which injects real, reversible failures so the
+checks have something true to catch. Red and amber mean the tool is working; a
+green board would mean nothing had been tested. The dashboard says so in a
+banner at the top.
+
 Two things to expect on a free-tier instance: the first request after ~15
 minutes of inactivity takes **up to a minute** while the service cold-starts,
-and the overall verdict reads whatever the memory *actually* is — it is wired
-to real data and is frequently not green.
+and the overall verdict reads whatever the memory *actually* is.
+
+The frontend degrades per-panel rather than all-or-nothing. Each feed is fetched
+independently (`Promise.allSettled`, one retry with backoff); a feed that fails
+marks *its own* card stale and leaves the rest live, and the "cannot reach the
+API" state appears only when every feed fails. An earlier version used
+`Promise.all`, so a single transient 404 during cold start discarded six good
+responses and blanked the whole board — the opposite of the per-signal honesty
+the checks themselves are built on.
 
 <details>
 <summary>Deploying it yourself</summary>

@@ -201,6 +201,33 @@ body[data-refreshing="1"] main { opacity: .62; }
 .callout[data-s="critical"] { border-color: color-mix(in srgb, var(--critical) 55%, transparent); background: color-mix(in srgb, var(--critical) 10%, transparent); }
 .callout[data-s="critical"] .callout-g { color: var(--critical); }
 
+/* ---------- demo-environment notice ---------- */
+.demo-banner {
+  display: flex; align-items: flex-start; gap: 9px;
+  border: 1px solid color-mix(in srgb, var(--series-1) 40%, transparent);
+  background: color-mix(in srgb, var(--series-1) 9%, transparent);
+  border-radius: 5px; padding: 9px 12px; font-size: 12px; color: var(--ink-2);
+  line-height: 1.5; margin-bottom: 14px;
+}
+.demo-banner .g { color: var(--series-1); font-size: 10px; line-height: 1.6; }
+.demo-banner b { color: var(--ink); font-weight: 600; }
+.demo-banner code {
+  font-family: var(--mono); font-size: 11px;
+  background: var(--raised); padding: 1px 4px; border-radius: 3px;
+}
+
+/* ---------- per-feed staleness ---------- */
+.stale-badge {
+  font-size: 10px; font-weight: 600; letter-spacing: .05em; text-transform: uppercase;
+  color: var(--warn); border: 1px solid color-mix(in srgb, var(--warn) 45%, transparent);
+  background: color-mix(in srgb, var(--warn) 10%, transparent);
+  padding: 2px 7px; border-radius: 3px; white-space: nowrap;
+}
+.card[data-stale="1"] { border-color: color-mix(in srgb, var(--warn) 35%, transparent); }
+.card[data-stale="1"] .flag-stats,
+.card[data-stale="1"] .chart-block,
+.card[data-stale="1"] .tablewrap { opacity: .55; }
+
 .banner {
   display: none; align-items: center; gap: 8px;
   border: 1px solid color-mix(in srgb, var(--critical) 55%, transparent);
@@ -228,6 +255,16 @@ body[data-conn="down"] .banner { display: flex; }
 <main>
   <div class="banner" role="alert">
     <span>⚠</span><span id="bannerText">Dashboard cannot reach the API — values below are the last successful read, not current.</span>
+  </div>
+
+  <div class="demo-banner">
+    <span class="g">◆</span>
+    <span><b>Demo environment — failures below are injected on purpose.</b>
+    This dashboard reads a live CockroachDB cluster. The <code>demo-</code> agents are driven by
+    <code>demo_harness.py</code>, which injects real, reversible failures — expired memories,
+    off-topic retrievals, a deliberately miscalibrated similarity floor — so the checks have
+    something true to catch. <b>Red and amber here mean the tool is working.</b>
+    A green board would mean nothing had been tested.</span>
   </div>
 
   <!-- overall -->
@@ -278,7 +315,7 @@ body[data-conn="down"] .banner { display: flex; }
 
   <!-- flagship -->
   <section class="flagship">
-    <div class="card">
+    <div class="card" id="cardDegradation">
       <div class="card-head">
         <div>
           <div class="card-title">Retrieval degradation</div>
@@ -335,7 +372,7 @@ body[data-conn="down"] .banner { display: flex; }
 
   <!-- threshold calibration -->
   <section>
-    <div class="card">
+    <div class="card" id="cardCalibration">
       <div class="card-head">
         <div>
           <div class="card-title">Threshold calibration</div>
@@ -384,7 +421,7 @@ body[data-conn="down"] .banner { display: flex; }
 
   <!-- agent impact -->
   <section>
-    <div class="card">
+    <div class="card" id="cardImpact">
       <div class="card-head">
         <div>
           <div class="card-title">Agent impact</div>
@@ -411,7 +448,7 @@ body[data-conn="down"] .banner { display: flex; }
 
   <!-- corpus + retrievals -->
   <section class="grid-2">
-    <div class="card">
+    <div class="card" id="cardCorpus">
       <div class="card-head">
         <div class="card-title">Memory corpus</div>
         <div class="card-sub" id="corpusAgents">—</div>
@@ -427,7 +464,7 @@ body[data-conn="down"] .banner { display: flex; }
       </div>
     </div>
 
-    <div class="card">
+    <div class="card" id="cardRetrievals">
       <div class="card-head">
         <div class="card-title">Recent retrievals</div>
         <div class="card-sub" id="retSub">—</div>
@@ -1064,55 +1101,126 @@ function renderRetrievals(data) {
 }
 
 /* ---------- data loop ---------- */
-async function getJSON(url) {
-  const res = await fetch(url, { cache: "no-store" });
-  if (!res.ok) throw new Error(`${url} -> ${res.status}`);
-  return res.json();
+
+// One retry with backoff. A free-tier instance that has spun down answers the
+// first request(s) after wake with an edge 404/502/503 before the container is
+// routable; that is a transient condition, not "the API is unreachable".
+const RETRY_STATUSES = new Set([404, 429, 500, 502, 503, 504]);
+
+async function getJSON(url, { retries = 1, backoffMs = 600 } = {}) {
+  let lastErr;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const res = await fetch(url, { cache: "no-store" });
+      if (res.ok) return await res.json();
+      lastErr = new Error(`${url} -> ${res.status}`);
+      if (!RETRY_STATUSES.has(res.status)) break;   // 4xx we caused: don't retry
+    } catch (err) {
+      lastErr = err;                                 // network/DNS: worth one retry
+    }
+    if (attempt < retries) await new Promise(r => setTimeout(r, backoffMs * (attempt + 1)));
+  }
+  throw lastErr;
 }
+
+// Nudge the container awake before fanning out. Cheap, never touches the
+// database, and failing it is not itself an error — the fan-out still runs.
+async function warmUp() {
+  try { await getJSON("/healthz", { retries: 2, backoffMs: 1200 }); } catch { /* ignore */ }
+}
+
+function setStale(cardId, stale, label) {
+  const card = $(cardId);
+  if (!card) return;
+  card.dataset.stale = stale ? "1" : "0";
+  let badge = card.querySelector(".stale-badge");
+  if (stale) {
+    if (!badge) {
+      badge = document.createElement("span");
+      badge.className = "stale-badge";
+      (card.querySelector(".card-head") || card).appendChild(badge);
+    }
+    badge.textContent = label || "stale — last successful read";
+  } else if (badge) {
+    badge.remove();
+  }
+}
+
+const FEEDS = [
+  { key: "current", url: "/api/health/current" },
+  { key: "history", url: "/api/health/history?hours=24&buckets=48" },
+  { key: "stats",   url: "/api/memory/stats",                       card: "cardCorpus" },
+  { key: "deg",     url: "/api/retrievals/degradation?hours=24",        card: "cardDegradation" },
+  { key: "recent",  url: "/api/retrievals/recent?limit=50",             card: "cardRetrievals" },
+  { key: "sim",     url: "/api/retrievals/similarity?hours=24&bins=28", card: "cardCalibration" },
+  { key: "impact",  url: "/api/agent/impact?hours=24&limit=25",         card: "cardImpact" },
+];
 
 async function refresh() {
   document.body.dataset.refreshing = "1";
+  await warmUp();
   try {
-    const [current, history, stats, deg, recent, sim, impact] = await Promise.all([
-      getJSON("/api/health/current"),
-      getJSON("/api/health/history?hours=24&buckets=48"),
-      getJSON("/api/memory/stats"),
-      getJSON("/api/retrievals/degradation?hours=24"),
-      getJSON("/api/retrievals/recent?limit=50"),
-      getJSON("/api/retrievals/similarity?hours=24&bins=28"),
-      getJSON("/api/agent/impact?hours=24&limit=25"),
-    ]);
-    cache.history = history;
-    cache.degradation = deg;
-    cache.similarity = sim;
-    cache.current = current;
+    // allSettled, not all: one failed feed must not discard the six that
+    // succeeded. Each section reports its own state — the same per-panel
+    // honesty the checks themselves are built on.
+    const settled = await Promise.allSettled(FEEDS.map(f => getJSON(f.url)));
+    const data = {};
+    const failed = [];
+    settled.forEach((result, i) => {
+      const feed = FEEDS[i];
+      if (result.status === "fulfilled") {
+        data[feed.key] = result.value;
+        if (feed.card) setStale(feed.card, false);
+      } else {
+        failed.push(feed.key);
+        if (feed.card) setStale(feed.card, true);
+        console.error(feed.url, result.reason);
+      }
+    });
 
-    renderOverall(current, stats);
-    renderPanels(current, history);
-    renderDegradation(deg);
-    renderCalibration(sim, current);
-    renderImpact(impact);
-    renderStats(stats);
-    renderRetrievals(recent);
+    if (data.history) cache.history = data.history;
+    if (data.deg) cache.degradation = data.deg;
+    if (data.sim) cache.similarity = data.sim;
+    if (data.current) cache.current = data.current;
 
-    document.body.dataset.conn = "up";
-    $("connLabel").textContent = "live";
-    $("lastUpdated").textContent = timeFmt.format(new Date());
-  } catch (err) {
-    // A failed fetch is an unknown state, never a healthy one.
-    document.body.dataset.conn = "down";
-    $("connLabel").textContent = "no data";
-    $("overallStatus").textContent = "Unknown";
-    $("overallReason").textContent = "Dashboard cannot reach the API — this is not a healthy state.";
-    $("heroRail").style.background = cssVar("--unknown");
-    $("heroGlyph").textContent = GLYPH.unknown;
-    $("heroGlyph").style.color = cssVar("--unknown");
-    $("factAge").textContent = "unknown";
-    console.error(err);
+    // The hero is the one thing that must never show a stale-but-green verdict.
+    if (data.current) {
+      renderOverall(data.current, data.stats);
+      if (data.history) renderPanels(data.current, data.history);
+    } else {
+      renderOverallUnreachable("health endpoint did not respond — this is not a healthy state");
+    }
+    if (data.deg) renderDegradation(data.deg);
+    if (data.sim && (data.current || cache.current)) renderCalibration(data.sim, data.current || cache.current);
+    if (data.impact) renderImpact(data.impact);
+    if (data.stats) renderStats(data.stats);
+    if (data.recent) renderRetrievals(data.recent);
+
+    const allFailed = failed.length === FEEDS.length;
+    document.body.dataset.conn = allFailed ? "down" : "up";
+    if (allFailed) {
+      $("connLabel").textContent = "no data";
+      renderOverallUnreachable("Dashboard cannot reach the API — this is not a healthy state.");
+    } else if (failed.length) {
+      $("connLabel").textContent = `${FEEDS.length - failed.length}/${FEEDS.length} feeds`;
+      $("lastUpdated").textContent = timeFmt.format(new Date());
+    } else {
+      $("connLabel").textContent = "live";
+      $("lastUpdated").textContent = timeFmt.format(new Date());
+    }
   } finally {
     document.body.dataset.refreshing = "0";
     countdown = REFRESH_MS / 1000;
   }
+}
+
+function renderOverallUnreachable(reason) {
+  $("overallStatus").textContent = "Unknown";
+  $("overallReason").textContent = reason;
+  $("heroRail").style.background = cssVar("--unknown");
+  $("heroGlyph").textContent = GLYPH.unknown;
+  $("heroGlyph").style.color = cssVar("--unknown");
+  $("factAge").textContent = "unknown";
 }
 
 $("btnChart").addEventListener("click", () => {
