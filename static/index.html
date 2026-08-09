@@ -946,9 +946,10 @@ function renderImpact(data) {
     $("impactCopy").innerHTML = `No agent turns in the last ${data.hours}h. This panel needs the agent to actually run.`;
   } else if (t.near_miss_fed) {
     $("impactCopy").innerHTML =
-      `<b>${t.near_miss_fed} of ${t.blind_turns} blind answers were caused by the similarity floor, not missing memory.</b> ` +
-      `The agent held a relevant memory, the retrieval policy discarded it, and the model answered ungrounded. ` +
-      `Every row below links to the retrieval id that produced it.`;
+      `<b>${t.near_miss_fed} of ${t.blind_turns} blind answers are consistent with the floor rejecting a relevant result.</b> ` +
+      `Their best candidate scored just under the applied floor — close enough that the retrieval policy, rather than an ` +
+      `empty corpus, may be what left the model ungrounded. This is a correlation the check can see, not a cause it can ` +
+      `prove: an evicted memory also leaves low-scoring leftovers behind. Every row links to the retrieval that produced it.`;
   } else if (t.blind_turns) {
     $("impactCopy").innerHTML =
       `${t.blind_turns} of ${t.turns} turns answered with no memory at all — the corpus had nothing relevant. ` +

@@ -60,7 +60,10 @@ CREATE TABLE agent_turns (
     memories_used INT NOT NULL DEFAULT 0,
     model_id STRING,
     latency_ms INT,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- clock_timestamp(), NOT now(): now() is the TRANSACTION timestamp in
+    -- CockroachDB, so several turns written in one transaction would share a
+    -- byte-identical created_at and become unorderable in the UI.
+    created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
     INDEX (agent_id, created_at DESC),
     INDEX (retrieval_id)
 ) WITH (ttl_expire_after = '30 days');

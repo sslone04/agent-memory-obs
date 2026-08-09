@@ -620,20 +620,25 @@ def do_story(conn: psycopg.Connection) -> None:
 
     phase(
         "STORY 3/5 — WARNING: health degrades BEFORE the answer does",
-        "Those exact records are given an expires_at inside the eviction "
-        "window. They are still live and still retrievable, so the agent is "
-        "unaffected -- but eviction_pressure fires now. This is the whole "
-        "point: the dashboard warns while the answers are still correct.",
+        "This agent's whole memory is given an expires_at inside the eviction "
+        "window -- the realistic shape of the failure, a corpus aging out, not "
+        "two rows vanishing. The records are still live and still retrievable, "
+        "so the answer is unchanged -- but eviction_pressure fires NOW. That is "
+        "the thesis: the dashboard warns while the answers are still correct.",
     )
     with conn.cursor() as cur:
+        # Expire the agent's entire corpus, not just the rows feeding this one
+        # question. Eviction pressure is a *share* of live rows, and one
+        # question's worth is never a meaningful share -- scoping it that
+        # tightly left the check green and made the demo argue against itself.
         cur.execute(
             """
             UPDATE memory_records SET expires_at = now() + INTERVAL '45 minutes'
-            WHERE id = ANY(%s) AND agent_id LIKE %s
+            WHERE agent_id = %s AND agent_id LIKE %s
             """,
-            (fed_ids, DEMO_LIKE),
+            (AGENT_MAIN, DEMO_LIKE),
         )
-        step(f"set expires_at on {cur.rowcount} record(s), 45 minutes out")
+        step(f"set expires_at on {cur.rowcount} record(s) (whole corpus), 45 minutes out")
     evic = checks.check_eviction_pressure(conn)
     step(
         f"eviction_pressure -> {evic['severity'].upper()} "
@@ -650,25 +655,43 @@ def do_story(conn: psycopg.Connection) -> None:
     phase(
         "STORY 4/5 — FAILURE: the memory expires, the agent goes blind",
         "The same records expire. recall() filters expired rows, so the same "
-        "question now retrieves nothing above the floor and the agent answers "
-        "without context. Nothing errors. Nothing retries. The agent simply "
-        "stops knowing.",
+        "question now retrieves NOTHING AT ALL -- not a weak match, zero "
+        "candidates -- and the agent answers without context. Nothing errors. "
+        "Nothing retries. The agent simply stops knowing.",
     )
     with conn.cursor() as cur:
         cur.execute(
             """
             UPDATE memory_records SET expires_at = now() - INTERVAL '1 minute'
-            WHERE id = ANY(%s) AND agent_id LIKE %s
+            WHERE agent_id = %s AND agent_id LIKE %s
             """,
-            (fed_ids, DEMO_LIKE),
+            (AGENT_MAIN, DEMO_LIKE),
         )
-        step(f"expired {cur.rowcount} record(s)")
+        step(f"expired {cur.rowcount} record(s) -- the corpus is now gone from retrieval")
     broken = _ask(agent, STORY_QUESTION, conn)
+
+    # Report which check owns this failure. The interesting result is that
+    # empty_resolve stays OK: it counts retrievals that found candidates and
+    # cleared none -- a *relevance* failure. This is an *availability* failure,
+    # and the checks are supposed to tell those apart rather than both firing.
+    evic2 = checks.check_eviction_pressure(conn)
     empty = checks.check_empty_resolve(conn)
     step(
-        f"empty_resolve -> {empty['severity'].upper()} "
-        f"({empty['detail']['floored_out']} of {empty['detail']['retrievals']} "
-        f"retrievals floored out in {empty['detail']['window_minutes']}m)"
+        f"eviction_pressure -> {evic2['severity'].upper()} "
+        f"({evic2['detail']['expiring_within_horizon']} of "
+        f"{evic2['detail']['live_rows']} live rows) -- it went CRITICAL one "
+        f"beat ago and is quiet now for the worst reason: the rows it was "
+        f"warning about are already gone, so there is no pressure left"
+    )
+    step(
+        f"empty_resolve     -> {empty['severity'].upper()} "
+        f"({empty['detail']['floored_out']} floored out of "
+        f"{empty['detail']['retrievals']}) -- correctly quiet: nothing was "
+        f"rejected, there was nothing to reject"
+    )
+    step(
+        f"agent_turns       -> memories_used=0, raw_candidates="
+        f"{broken.raw_candidates} -- the agent answered blind"
     )
     if broken.retrieval_id:
         step(f"the bad answer traces to retrieval {broken.retrieval_id}")
@@ -682,8 +705,8 @@ def do_story(conn: psycopg.Connection) -> None:
     with conn.cursor() as cur:
         cur.execute(
             "UPDATE memory_records SET expires_at = NULL "
-            "WHERE id = ANY(%s) AND agent_id LIKE %s",
-            (fed_ids, DEMO_LIKE),
+            "WHERE agent_id = %s AND agent_id LIKE %s",
+            (AGENT_MAIN, DEMO_LIKE),
         )
         step(f"restored {cur.rowcount} record(s)")
     healed = _ask(agent, STORY_QUESTION, conn)
