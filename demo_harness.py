@@ -51,7 +51,17 @@ AGENT_EVICT = "demo-evict-heavy"
 AGENT_DRIFT = "demo-drift-writer"
 SESSION = "demo-session"
 
-TABLES = ("memory_records", "memory_retrievals", "memory_health_events", "agent_config")
+# agent_turns MUST come before memory_retrievals: the FK is ON DELETE SET NULL,
+# so clearing retrievals first would strand the turns with a null link instead
+# of removing them, which is exactly how orphaned turns appeared in the
+# Agent impact panel.
+TABLES = (
+    "agent_turns",
+    "memory_records",
+    "memory_retrievals",
+    "memory_health_events",
+    "agent_config",
+)
 
 # ---------------------------------------------------------------------------
 # Demo corpus -- a plausible infrastructure assistant's memory.
