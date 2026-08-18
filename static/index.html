@@ -282,12 +282,15 @@ body[data-conn="down"] .banner { display: flex; }
 
   <div class="demo-banner">
     <span class="g">◆</span>
-    <span><b>Demo environment — failures below are injected on purpose.</b>
-    This dashboard reads a live CockroachDB cluster. The <code>demo-</code> agents are driven by
-    <code>demo_harness.py</code>, which injects real, reversible failures — expired memories,
-    off-topic retrievals, a deliberately miscalibrated similarity floor — so the checks have
-    something true to catch. <b>Red and amber here mean the tool is working.</b>
-    A green board would mean nothing had been tested.</span>
+    <span><b>Demo environment — the failures below are injected on purpose.</b>
+    <code>demo_harness.py</code> writes real, reversible failures into this live CockroachDB
+    cluster — expired memories, off-topic retrievals, a deliberately miscalibrated similarity
+    floor — so the checks have something true to catch, and a scheduled job re-injects them
+    every 30 minutes. Every check looks back 60 minutes, so an injection ages out of that
+    window and the board settles back to green between runs: that is the checks reporting a
+    quiet window honestly, not a tool that has stopped working.
+    <b>The 24-hour strips under each panel hold the record of what was caught</b> — they carry
+    the history the current verdict cannot.</span>
   </div>
 
   <!-- overall -->

@@ -23,6 +23,18 @@ checks have something true to catch. Red and amber mean the tool is working; a
 green board would mean nothing had been tested. The dashboard says so in a
 banner at the top.
 
+**The demo refreshes itself.** Every check reads a 60-minute window, so a
+failure injected once is invisible an hour later — and a visitor arriving at an
+arbitrary time would find a green board sitting under a banner promising
+injected failures. A second Lambda, `memory-demo-injector`, re-runs the two
+retrieval injections every 30 minutes so the live window is populated whenever
+anyone looks. See [Keeping the demo populated](#keeping-the-demo-populated).
+
+If you do catch it green, that is the design working rather than failing: the
+checks are reporting a quiet window honestly instead of holding a stale alarm.
+The 24-hour strips under each panel carry the history the current verdict
+cannot.
+
 Two things to expect on a free-tier instance: the first request after ~15
 minutes of inactivity takes **up to a minute** while the service cold-starts,
 and the overall verdict reads whatever the memory *actually* is.
@@ -150,7 +162,8 @@ flowchart TB
 | `api.py` | Read-only FastAPI backend for the dashboard |
 | `static/index.html` | The dashboard — single page, no build step |
 | `demo_harness.py` | Labeled, reversible failure injection and the demo driver |
-| `scripts/` | `apply_schema.py`, `deploy_lambda.sh` |
+| `demo_injector.py` | Scheduled Lambda that keeps the demo populated (30-min refresh) |
+| `scripts/` | `apply_schema.py`, `deploy_lambda.sh`, `deploy_demo_injector.sh` |
 
 **The link that makes it work:** every `recall()` writes a `memory_retrievals`
 row, and every agent turn writes an `agent_turns` row carrying that retrieval's
@@ -274,7 +287,7 @@ application-level eviction policy that the memory layer reads and
 x86_64, 512 MB, 60s. `run_all()` is the same code path the CLI uses, so the
 scheduled checks and a local run cannot drift apart.
 
-**Two packaging requirements**, both learned the hard way:
+**Three packaging requirements**, all learned the hard way:
 
 1. Build with Linux wheels (`--platform manylinux2014_x86_64 --only-binary=:all:`)
    or you ship macOS arm64 binaries that fail at import.
@@ -286,11 +299,24 @@ scheduled checks and a local run cannot drift apart.
    Ship `root.crt` in the zip and point `sslrootcert=/var/task/root.crt`.
    TLS verification stays at `verify-full` — this is not a downgrade.
 
+`demo_injector.py` is a **second** Lambda (`memory-demo-injector`) — python3.12,
+x86_64, 512 MB, 180s — covered in
+[Keeping the demo populated](#keeping-the-demo-populated). It is deliberately a
+separate function with its own role: the checker only ever reads, the injector
+writes, and nothing that needs to read should inherit the ability to write.
+
+3. **Name `typing-extensions` explicitly.** psycopg imports it at module load on
+   any Python below 3.13 (`psycopg/_compat.py`), but pip does not resolve it as
+   a dependency under `--python-version 3.12`. Omit it and you get a package
+   that imports cleanly on the host and dies in Lambda with
+   `No module named 'typing_extensions'`. Both deploy scripts pin it.
+
 ### EventBridge Scheduler
 
-A `rate(5 minutes)` schedule invokes the function via a scoped role that can
-call `lambda:InvokeFunction` on that one function. `scripts/deploy_lambda.sh`
-creates all of it.
+A `rate(5 minutes)` schedule invokes the checks via a scoped role that can call
+`lambda:InvokeFunction` on that one function, and a `rate(30 minutes)` schedule
+invokes the injector the same way. `scripts/deploy_lambda.sh` and
+`scripts/deploy_demo_injector.sh` create all of it.
 
 Note the IAM shape: `AWSLambda_FullAccess` grants **no** EventBridge access, so
 the deploying principal needs `scheduler:CreateSchedule` (and `iam:PassRole`
@@ -387,6 +413,99 @@ function, and puts it on a 5-minute schedule. Re-run to update.
 > **Cost note:** the 5-minute schedule runs ~8,640 times/month. Lambda cost is
 > pennies, but each run opens a CockroachDB connection and writes 5 rows. Pause
 > with `aws scheduler update-schedule --name memory-health-checks-every-5min --state DISABLED`.
+
+---
+
+## Keeping the demo populated
+
+Judging runs for days and nobody controls when a judge opens the dashboard. The
+five checks each read a **60-minute** window, so a failure injected by hand is
+gone from every panel an hour later. Without something to refresh it, most
+arrivals would land on a green board underneath a banner insisting the failures
+are deliberate — the one reading that makes the whole project look broken.
+
+`demo_injector.py` closes that gap. It runs as its own Lambda on a
+`rate(30 minutes)` schedule and, on each run:
+
+1. **Prunes** `demo-` rows older than 24h.
+2. **Tops up the healthy baseline** — four on-topic recalls, and the corpus
+   itself if it is missing.
+3. **Injects `near_miss`**, then **`degradation`** — the same
+   `inject_near_miss()` and `inject_degradation()` the CLI calls. It imports
+   them from `demo_harness.py` rather than restating them, so there is exactly
+   one definition of what a near miss is and the scheduled demo cannot drift
+   from the one you run locally.
+
+The healthy recalls in step 2 are not part of the two injections. They are there
+because after a prune the only demo retrievals left inside the window would be
+failures, and the calibration histogram needs the returned-to-agent cluster to
+make the discarded ones legible as a *separate mode* rather than as all the data
+there is.
+
+```sh
+./scripts/deploy_demo_injector.sh                       # deploy or update
+aws lambda invoke --function-name memory-demo-injector \
+  --region us-east-1 /dev/stdout                        # run it once, now
+```
+
+### Why it cannot touch anything real
+
+Four independent guards, in the order they apply:
+
+| Guard | What it prevents |
+|---|---|
+| `require_demo()` | Any write whose `agent_id` lacks the `demo-` prefix raises before a statement runs. |
+| `protected_counts()` / `assert_untouched()` | Non-demo row counts are snapshotted across all five tables before and after every run. One changed row aborts it. |
+| Predicated DELETEs | Every statement the pruner issues carries `agent_id LIKE 'demo-%'`. |
+| Its own IAM role | Separate from the checker's. Its only non-logging grant is `bedrock:InvokeModel` on the single Titan embedding model. |
+
+The dashboard is unaffected by any of this: `api.py` still holds its session
+`read_only`, so the web service cannot write regardless of what the injector
+does.
+
+Errors are redacted before they reach CloudWatch. psycopg quotes the connection
+string in its exception messages, so `lambda_handler` rewrites any
+`postgres://…` it finds before re-raising.
+
+### Bounding the growth
+
+48 runs a day at ~23 retrievals each is ~1,100 rows a day, which would grow
+without end over a judging period.
+
+**The choice made here is an age bound, not a row cap:** each run first deletes
+`demo-` rows older than **24 hours** from `memory_retrievals`, `agent_turns`
+and `memory_health_events`. 24h is not arbitrary — it is the widest window any
+panel on the dashboard reads, so a demo row older than that is already invisible
+everywhere and costs only storage. Steady state is a function of the schedule
+(~1,100 retrievals) rather than of how long judging happens to run.
+
+A row cap was the alternative and is worse here: it has to decide *which* rows
+to drop, and dropping the oldest would quietly delete points out from under the
+24-hour charts mid-window.
+
+Two things the pruner deliberately does not do:
+
+- **`memory_records` is never pruned.** It is the corpus the injections retrieve
+  *against*. Delete it and every near miss becomes an empty-corpus miss, which
+  is the other failure class entirely.
+- **A retrieval is kept while any `agent_turn` still references it.** The
+  foreign key is `ON DELETE SET NULL`, so pruning a referenced retrieval would
+  silently break the turn → retrieval trace the Agent impact panel is built on.
+
+### Pausing it
+
+The demo refresh is the one scheduled thing that writes. To stop it:
+
+```sh
+aws scheduler update-schedule --name memory-demo-injector-every-30min \
+  --region us-east-1 --state DISABLED \
+  --schedule-expression 'rate(30 minutes)' \
+  --flexible-time-window '{"Mode":"OFF"}' \
+  --target '{"Arn":"arn:aws:lambda:us-east-1:<account>:function:memory-demo-injector",
+             "RoleArn":"arn:aws:iam::<account>:role/memory-demo-injector-scheduler-role"}'
+```
+
+`demo_harness.py reset --yes` removes every `demo-` row afterwards.
 
 ---
 
