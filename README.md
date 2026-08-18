@@ -339,6 +339,11 @@ scoped to the scheduler role) added separately.
 git clone https://github.com/sslone04/agent-memory-obs.git
 cd agent-memory-obs
 
+# Activate the pre-commit secret guard. Git does not pick up .githooks/ on its
+# own, and hook configuration is machine state that a clone does not carry, so
+# this is opt-in per checkout.
+git config core.hooksPath .githooks
+
 python3.12 -m venv .venv
 ./.venv/bin/pip install -r requirements.txt
 ```
@@ -356,8 +361,10 @@ cp .env.example .env
 # edit .env and paste your connection string into DATABASE_URL
 ```
 
-`.env` is gitignored and blocked by the pre-commit hook. Nothing else in this
-repo needs a secret.
+`.env` is gitignored. It is *also* blocked by the pre-commit hook in
+`.githooks/`, but only once you have pointed git at it with the
+`core.hooksPath` command in step 1 — a clone alone does not enable it. Nothing
+else in this repo needs a secret.
 
 ### 3. Apply the schema
 
