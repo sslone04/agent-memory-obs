@@ -231,6 +231,26 @@ body[data-refreshing="1"] main { opacity: .62; }
 .card[data-stale="1"] .chart-block,
 .card[data-stale="1"] .tablewrap { opacity: .55; }
 
+
+/* ---------- terminology key (native disclosure, no script) ---------- */
+.gloss-card summary {
+  font-size: 11px; font-weight: 600; letter-spacing: .07em; text-transform: uppercase;
+  color: var(--ink-2); cursor: pointer; list-style-position: outside;
+}
+.gloss-card summary::marker { color: var(--muted); }
+.gloss-card summary:focus-visible { outline: 1px solid var(--ink-2); outline-offset: 3px; }
+.gloss {
+  display: grid; grid-template-columns: max-content minmax(0, 1fr);
+  gap: 7px 20px; margin: 14px 0 0; padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+.gloss dt { font-family: var(--mono); font-size: 11.5px; color: var(--ink); white-space: nowrap; }
+.gloss dd { margin: 0; font-size: 12px; color: var(--ink-2); }
+@media (max-width: 520px) {
+  .gloss { grid-template-columns: minmax(0, 1fr); gap: 2px 0; }
+  .gloss dd { margin-bottom: 8px; }
+}
+
 .banner {
   display: none; align-items: center; gap: 8px;
   border: 1px solid color-mix(in srgb, var(--critical) 55%, transparent);
@@ -486,6 +506,27 @@ body[data-conn="down"] .banner { display: flex; }
       </div>
     </div>
   </section>
+
+  <!-- terminology -->
+  <section>
+    <div class="card gloss-card">
+      <details>
+        <summary>Terminology</summary>
+        <dl class="gloss">
+        <dt>raw</dt><dd>candidate memories the vector search found</dd>
+        <dt>returned</dt><dd>how many survived the cutoff and reached the agent</dd>
+        <dt>floored out</dt><dd>raw &gt; 0 but returned = 0: found, then discarded</dd>
+        <dt>top sim</dt><dd>best match score, 0 to 1, before the cutoff applies</dd>
+        <dt>floor / cutoff</dt><dd>the minimum score a result must reach to be returned</dd>
+        <dt>near miss</dt><dd>scored just under the floor: probably should have been returned</dd>
+        <dt>genuine miss</dt><dd>scored far below the floor: correctly rejected</dd>
+        <dt>blind</dt><dd>an agent answer produced with zero memories retrieved</dd>
+        <dt>effective age</dt><dd>how old the FACT is, as opposed to when the row was written</dd>
+        <dt>eviction</dt><dd>memory removed on expiry, not deleted by a user</dd>
+        </dl>
+      </details>
+    </div>
+  </section>
 </main>
 
 <div id="tip" role="tooltip"></div>
@@ -546,6 +587,12 @@ function fmtAge(sec) {
 const timeFmt = new Intl.DateTimeFormat([], { hour: "2-digit", minute: "2-digit", hour12: false });
 const dateTimeFmt = new Intl.DateTimeFormat([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", hour12: false });
 function cssVar(name) { return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
+function withAlpha(hex, a) {
+  const m = /^#([\da-f]{2})([\da-f]{2})([\da-f]{2})$/i.exec(hex);
+  if (!m) return hex;
+  const [r, g, b] = m.slice(1).map(h => parseInt(h, 16));
+  return `rgba(${r}, ${g}, ${b}, ${a})`;
+}
 
 /* ---------- tooltip ---------- */
 const tip = $("tip");
@@ -796,14 +843,18 @@ function renderScatter(data, floor) {
     datasets.push({
       label: `rolling avg similarity (${Math.min(20, Math.max(3, Math.round(pts.length / 6)))}-pt)`,
       data: roll,
-      borderColor: cssVar("--series-2"),
+      borderColor: withAlpha(cssVar("--good"), 0.7),
       backgroundColor: "transparent",
-      borderWidth: 2.5,
+      borderWidth: 1.5,
       pointRadius: 0,
       pointHitRadius: 0,
+      pointStyle: "line",          // legend swatch reads as a line, not a dot
       showLine: true,
       tension: 0.3,
-      order: -1,
+      // Chart.js draws the order-sorted metas back to front, so the HIGHEST
+      // order is painted first and ends up underneath. The trend must never
+      // occlude an individual retrieval -- the points are the evidence.
+      order: 10,
     });
   }
 
