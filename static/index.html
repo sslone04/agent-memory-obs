@@ -242,8 +242,8 @@ body[data-conn="down"] .banner { display: flex; }
 
 <header class="topbar">
   <div class="brand">
-    <h1>Memory Health</h1>
-    <span class="env">agent-memory-observability · us-east-1 · defaultdb</span>
+    <h1>Memory Health Monitor</h1>
+    <span class="env">— observes agent memory · us-east-1 · defaultdb</span>
   </div>
   <div class="topmeta">
     <span><span class="pulse"></span><span id="connLabel">live</span></span>
@@ -313,6 +313,83 @@ body[data-conn="down"] .banner { display: flex; }
     </div>
   </section>
 
+  <!-- threshold calibration -->
+  <section>
+    <div class="card" id="cardCalibration">
+      <div class="card-head">
+        <div>
+          <div class="card-title">Threshold calibration</div>
+          <div class="card-sub" id="calibSub">The memory is fine — the retrieval policy is wrong</div>
+        </div>
+        <span class="chip" id="calibChip"><span class="g">?</span><span class="lbl">unknown</span></span>
+      </div>
+
+      <div class="callout" id="calibCallout">
+        <span class="callout-g">◆</span>
+        <span id="calibCopy">Loading calibration data…</span>
+      </div>
+
+      <div class="flag-stats">
+        <div>
+          <div class="fact-label">Applied floor</div>
+          <div class="fact-value" id="calibFloor">—</div>
+        </div>
+        <div>
+          <div class="fact-label">Suggested floor</div>
+          <div class="fact-value" id="calibSuggested">—</div>
+        </div>
+        <div>
+          <div class="fact-label">False negatives · 60m</div>
+          <div class="fact-value" id="calibCount">—</div>
+        </div>
+        <div>
+          <div class="fact-label">Share of floored-out</div>
+          <div class="fact-value" id="calibShare">—</div>
+        </div>
+      </div>
+
+      <div class="chart-block">
+        <div class="chart-label">Every retrieval's best score
+          <span class="hint">· blue = returned · orange = rejected. Vertical lines mark current floor
+          vs suggested floor. The gap is the mis-calibration.</span></div>
+        <div id="chartHist"></div>
+        <div class="legend" style="margin-top:8px">
+          <span><i style="background:var(--series-1)"></i> returned to caller</span>
+          <span><i style="background:var(--series-2)"></i> rejected by the floor</span>
+        </div>
+      </div>
+
+      <div id="calibExamples"></div>
+    </div>
+  </section>
+
+  <!-- agent impact -->
+  <section>
+    <div class="card" id="cardImpact">
+      <div class="card-head">
+        <div>
+          <div class="card-title">Agent impact</div>
+          <div class="card-sub">Where a memory failure became an agent failure</div>
+        </div>
+        <span class="chip" id="impactChip"><span class="g">?</span><span class="lbl">unknown</span></span>
+      </div>
+
+      <div class="callout" id="impactCallout">
+        <span class="callout-g">◆</span>
+        <span id="impactCopy">Loading agent turns…</span>
+      </div>
+
+      <div class="flag-stats">
+        <div><div class="fact-label">Turns · 24h</div><div class="fact-value" id="impTurns">—</div></div>
+        <div><div class="fact-label">Answered blind</div><div class="fact-value" id="impBlind">—</div></div>
+        <div><div class="fact-label">Blind from near-miss</div><div class="fact-value" id="impNearMiss">—</div></div>
+        <div><div class="fact-label">Avg memories used</div><div class="fact-value" id="impAvgMem">—</div></div>
+      </div>
+
+      <div id="impactTable"></div>
+    </div>
+  </section>
+
   <!-- flagship -->
   <section class="flagship">
     <div class="card" id="cardDegradation">
@@ -367,82 +444,6 @@ body[data-conn="down"] .banner { display: flex; }
           </table>
         </div>
       </div>
-    </div>
-  </section>
-
-  <!-- threshold calibration -->
-  <section>
-    <div class="card" id="cardCalibration">
-      <div class="card-head">
-        <div>
-          <div class="card-title">Threshold calibration</div>
-          <div class="card-sub" id="calibSub">The memory is fine — the retrieval policy is wrong</div>
-        </div>
-        <span class="chip" id="calibChip"><span class="g">?</span><span class="lbl">unknown</span></span>
-      </div>
-
-      <div class="callout" id="calibCallout">
-        <span class="callout-g">◆</span>
-        <span id="calibCopy">Loading calibration data…</span>
-      </div>
-
-      <div class="flag-stats">
-        <div>
-          <div class="fact-label">Applied floor</div>
-          <div class="fact-value" id="calibFloor">—</div>
-        </div>
-        <div>
-          <div class="fact-label">Suggested floor</div>
-          <div class="fact-value" id="calibSuggested">—</div>
-        </div>
-        <div>
-          <div class="fact-label">False negatives · 60m</div>
-          <div class="fact-value" id="calibCount">—</div>
-        </div>
-        <div>
-          <div class="fact-label">Share of floored-out</div>
-          <div class="fact-value" id="calibShare">—</div>
-        </div>
-      </div>
-
-      <div class="chart-block">
-        <div class="chart-label">Top similarity distribution
-          <span class="hint">— every retrieval in the last 24h, by best pre-filter score</span></div>
-        <div id="chartHist"></div>
-        <div class="legend" style="margin-top:8px">
-          <span><i style="background:var(--series-1)"></i> returned to caller</span>
-          <span><i style="background:var(--series-2)"></i> rejected by the floor</span>
-        </div>
-      </div>
-
-      <div id="calibExamples"></div>
-    </div>
-  </section>
-
-  <!-- agent impact -->
-  <section>
-    <div class="card" id="cardImpact">
-      <div class="card-head">
-        <div>
-          <div class="card-title">Agent impact</div>
-          <div class="card-sub">Where a memory failure became an agent failure</div>
-        </div>
-        <span class="chip" id="impactChip"><span class="g">?</span><span class="lbl">unknown</span></span>
-      </div>
-
-      <div class="callout" id="impactCallout">
-        <span class="callout-g">◆</span>
-        <span id="impactCopy">Loading agent turns…</span>
-      </div>
-
-      <div class="flag-stats">
-        <div><div class="fact-label">Turns · 24h</div><div class="fact-value" id="impTurns">—</div></div>
-        <div><div class="fact-label">Answered blind</div><div class="fact-value" id="impBlind">—</div></div>
-        <div><div class="fact-label">Blind from near-miss</div><div class="fact-value" id="impNearMiss">—</div></div>
-        <div><div class="fact-label">Avg memories used</div><div class="fact-value" id="impAvgMem">—</div></div>
-      </div>
-
-      <div id="impactTable"></div>
     </div>
   </section>
 
@@ -501,13 +502,13 @@ const PANELS = [
     metric: d => ({ v: d.expiring_pct, unit: "%",
       note: `${fmt(d.expiring_within_horizon)} of ${fmt(d.live_rows)} live rows expire within ${d.horizon_minutes}m` }) },
   { key: "empty_resolve", title: "Retrieval degradation",
-    sub: "Candidates found, none cleared the floor",
+    sub: "Candidates found, all scored below the cutoff — memory present but irrelevant",
     metric: d => ({ v: d.floored_out_pct, unit: "%",
       note: d.sample_too_small
         ? `${fmt(d.retrievals)} retrievals in ${d.window_minutes}m — below the ${d.min_sample}-sample floor`
         : `${fmt(d.floored_out)} of ${fmt(d.retrievals)} retrievals in the last ${d.window_minutes}m` }) },
   { key: "near_miss", title: "Threshold calibration",
-    sub: "Relevant results the floor discarded",
+    sub: "Correct memories found and discarded by the cutoff — config problem, not data problem",
     metric: d => ({ v: d.near_miss, unit: "false neg",
       note: d.sample_too_small
         ? `only ${fmt(d.floored_out_total)} floored-out retrievals in ${d.window_minutes}m — below the ${d.min_sample}-sample floor`
@@ -886,8 +887,8 @@ function renderCalibration(sim, current) {
     $("calibCopy").innerHTML = "No recent calibration verdict — the checker may not be running.";
   } else if (!nm.near_miss) {
     $("calibCopy").innerHTML =
-      "No false negatives detected. Retrievals that returned nothing scored far below the floor, " +
-      "so they were genuine misses — a <b>data</b> question, not a threshold one.";
+      "No false negatives in 60m. Zero-result retrievals scored far below the floor — " +
+      "genuine misses (<b>data</b>), not near-misses (<b>config</b>).";
   } else {
     $("calibCopy").innerHTML =
       `<b>This is a configuration problem, not a data problem.</b> ${nm.near_miss} of ` +
