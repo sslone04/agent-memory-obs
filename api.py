@@ -16,6 +16,7 @@ from typing import Any, Iterator
 import psycopg
 from fastapi import FastAPI, Query
 from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 
 from checks import (
     EMPTY_RESOLVE_CRITICAL_PCT,
@@ -418,12 +419,104 @@ def retrievals_recent(limit: int = Query(50, ge=1, le=500)) -> dict[str, Any]:
     }
 
 
+@app.get("/api/retrievals/points")
+def retrievals_points(
+    hours: int = Query(24, ge=1, le=168),
+    limit: int = Query(2000, ge=50, le=5000),
+) -> dict[str, Any]:
+    """Individual retrievals, one row per point, for the scatter view.
+
+    Bucketed averages hide the thing that matters here: whether the rejected
+    scores form one cloud or two.  A near-miss cluster sitting just under the
+    floor and a genuine-miss cluster far below it average out to the same
+    number, so the aggregate view cannot tell a config problem from a data one.
+
+    The class is decided here rather than in the browser so the chart, the
+    near_miss check, and the histogram cannot disagree about what counts as a
+    near miss.  Rows with no score are counted but not returned -- there is no
+    y value to plot them at, and inventing one would be a lie about a panel
+    whose whole argument is that absent evidence is not evidence.
+    """
+    rows = _rows(
+        """
+        SELECT id, agent_id, query_text, raw_candidates, results_returned,
+               top_similarity, latency_ms, retrieved_at,
+               coalesce(applied_floor, %s) AS applied_floor
+        FROM memory_retrievals
+        WHERE extract(epoch FROM (now() - retrieved_at)) <= %s * 3600
+          AND top_similarity IS NOT NULL
+        ORDER BY retrieved_at
+        LIMIT %s
+        """,
+        (DEFAULT_MIN_SIMILARITY, hours, limit),
+    )
+
+    unscored = _one(
+        """
+        SELECT count(*) AS n
+        FROM memory_retrievals
+        WHERE extract(epoch FROM (now() - retrieved_at)) <= %s * 3600
+          AND top_similarity IS NULL
+        """,
+        (hours,),
+    )
+
+    points = []
+    counts = {"returned": 0, "near_miss": 0, "clear_miss": 0}
+    for row in rows:
+        score = float(row["top_similarity"])
+        floor = float(row["applied_floor"])
+        raw = row["raw_candidates"] or 0
+        floored = row["results_returned"] == 0 and raw > 0
+        if not floored:
+            cls = "returned"
+        elif score >= floor - NEAR_MISS_BAND:
+            cls = "near_miss"
+        else:
+            cls = "clear_miss"
+        counts[cls] += 1
+        points.append(
+            {
+                "id": str(row["id"]),
+                "t": row["retrieved_at"],
+                "agent_id": row["agent_id"],
+                "query_text": row["query_text"],
+                "top_similarity": round(score, 4),
+                "applied_floor": round(floor, 4),
+                "short_by": round(floor - score, 4) if floored else None,
+                "raw_candidates": row["raw_candidates"],
+                "results_returned": row["results_returned"],
+                "latency_ms": row["latency_ms"],
+                "cls": cls,
+            }
+        )
+
+    scored = len(points)
+    floored_total = counts["near_miss"] + counts["clear_miss"]
+    return {
+        "generated_at": _now(),
+        "hours": hours,
+        "band": NEAR_MISS_BAND,
+        "default_floor": DEFAULT_MIN_SIMILARITY,
+        "floors_in_force": sorted({p["applied_floor"] for p in points}),
+        "counts": counts,
+        "scored": scored,
+        "unscored": unscored.get("n", 0),
+        "truncated": scored == limit,
+        "avg_top_similarity": (
+            round(sum(p["top_similarity"] for p in points) / scored, 4) if scored else None
+        ),
+        "floored_rate": round(100.0 * floored_total / scored, 2) if scored else 0.0,
+        "points": points,
+    }
+
+
 @app.get("/api/retrievals/degradation")
 def retrievals_degradation(hours: int = Query(24, ge=1, le=168)) -> dict[str, Any]:
-    """Floored-out rate and average top similarity over time.
+    """Floored-out rate and average top similarity over time, bucketed.
 
-    Two measures on deliberately separate series -- the frontend plots them as
-    two charts, never one dual-axis plot.
+    Feeds the table view and the headline rate.  The chart view plots
+    /api/retrievals/points instead: same window, one row per retrieval.
     """
     bucket_seconds = max(300, int(hours * 3600 / 48))
     rows = _rows(
@@ -584,6 +677,12 @@ def healthz() -> dict[str, str]:
 @app.get("/")
 def index() -> FileResponse:
     return FileResponse(STATIC_DIR / "index.html")
+
+
+# Chart.js is vendored rather than pulled from a CDN: the demo has to render on
+# a judge's machine without depending on a third party being up, and the page
+# already ships as one self-contained file with no build step.
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
 if __name__ == "__main__":

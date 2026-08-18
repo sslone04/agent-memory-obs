@@ -133,6 +133,9 @@ section { margin-bottom: 16px; }
 .chart-label { font-size: 11px; color: var(--ink-2); margin-bottom: 2px; }
 .chart-label .hint { color: var(--muted); }
 .chart { width: 100%; display: block; }
+/* Chart.js needs a positioned box with a real height to size its canvas
+   against; the canvas itself must not carry width/height attributes. */
+.canvas-wrap { position: relative; width: 100%; height: 300px; }
 .empty {
   display: flex; align-items: center; justify-content: center;
   height: 120px; color: var(--muted); font-size: 12px;
@@ -350,13 +353,16 @@ body[data-conn="down"] .banner { display: flex; }
 
       <div class="chart-block">
         <div class="chart-label">Every retrieval's best score
-          <span class="hint">· blue = returned · orange = rejected. Vertical lines mark current floor
-          vs suggested floor. The gap is the mis-calibration.</span></div>
+          <span class="hint">· blue = returned · orange = rejected. Gold line is the cutoff in force,
+          green is the ideal zone. The gap between them is the mis-calibration.</span></div>
         <div id="chartHist"></div>
         <div class="legend" style="margin-top:8px">
-          <span><i style="background:var(--series-1)"></i> returned to caller</span>
-          <span><i style="background:var(--series-2)"></i> rejected by the floor</span>
+          <span><i style="background:var(--series-2)"></i> discarded by the cutoff</span>
+          <span><i style="background:var(--series-1)"></i> returned to the agent</span>
+          <span><i style="background:var(--warn);width:3px;border-radius:0"></i> cutoff in force</span>
+          <span><i style="background:var(--good);width:3px;border-radius:0"></i> ideal zone</span>
         </div>
+        <div class="metric-note" id="calibZoneNote"></div>
       </div>
 
       <div id="calibExamples"></div>
@@ -410,6 +416,10 @@ body[data-conn="down"] .banner { display: flex; }
           <div class="fact-value" id="degRate">—</div>
         </div>
         <div>
+          <div class="fact-label">Avg top similarity · 24h</div>
+          <div class="fact-value" id="degAvgSim">—</div>
+        </div>
+        <div>
           <div class="fact-label">Retrievals · 24h</div>
           <div class="fact-value" id="degTotal">—</div>
         </div>
@@ -417,20 +427,15 @@ body[data-conn="down"] .banner { display: flex; }
           <div class="fact-label">Floored out</div>
           <div class="fact-value" id="degFloored">—</div>
         </div>
-        <div>
-          <div class="fact-label">Similarity floor</div>
-          <div class="fact-value" id="degFloor">—</div>
-        </div>
       </div>
 
       <div id="degChartView">
         <div class="chart-block">
-          <div class="chart-label">Floored-out rate <span class="hint">— % of retrievals where every candidate fell below the floor</span></div>
-          <div id="chartRate"></div>
-        </div>
-        <div class="chart-block">
-          <div class="chart-label">Average top similarity <span class="hint">— best pre-filter score; falling toward the floor is the leading indicator</span></div>
-          <div id="chartSim"></div>
+          <div class="chart-label">Every retrieval in the window
+            <span class="hint">— one point per recall() call, at its best pre-filter score.
+            Shaded band is the near-miss zone: within 0.15 below the cutoff.</span></div>
+          <div class="canvas-wrap"><canvas id="chartScatter"></canvas></div>
+          <div class="metric-note" id="scatterNote"></div>
         </div>
       </div>
       <div id="degTableView" style="display:none">
@@ -485,6 +490,7 @@ body[data-conn="down"] .banner { display: flex; }
 
 <div id="tip" role="tooltip"></div>
 
+<script src="/static/vendor/chart.umd.min.js"></script>
 <script>
 "use strict";
 
@@ -519,7 +525,7 @@ const PANELS = [
       note: `null ${fmt(d.null_embeddings)} · wrong-dim ${fmt(d.wrong_dim)} · bad-norm ${fmt(d.bad_norm)} of ${fmt(d.total_rows)}` }) },
 ];
 
-let cache = { history: null, degradation: null, similarity: null, current: null };
+let cache = { history: null, degradation: null, points: null, similarity: null, current: null };
 let countdown = REFRESH_MS / 1000;
 
 /* ---------- helpers ---------- */
@@ -645,222 +651,441 @@ function renderStrip(el, history, key) {
   }
 }
 
-/* ---------- line chart (single series, one axis, no dual-axis ever) ---------- */
-function lineChart(host, points, opts) {
-  const width = host.clientWidth || 640;
-  const height = opts.height || 128;
-  const pad = { t: 10, r: 14, b: 20, l: 40 };
+/* ---------- retrieval scatter (one point per retrieval, one y-axis) ----------
+   Bucketed averages cannot answer the question this panel exists to answer.
+   A near-miss cluster just under the cutoff and a genuine-miss cluster far
+   below it collapse to the same average, so the aggregate view shows a config
+   problem and a data problem as the same line. Individual points keep the two
+   clusters visibly apart, and the gap between them is what makes the suggested
+   floor defensible instead of asserted.
 
-  if (!points.length) {
-    host.innerHTML = `<div class="empty">${opts.emptyText || "No data in this window."}</div>`;
-    return;
-  }
+   Everything here shares one linear y-axis in cosine-similarity units: the
+   points, the rolling average, the cutoff line, and the band. No second axis,
+   no indexing, nothing rescaled to fit. */
 
-  const values = points.map(opts.y).filter(v => v !== null && v !== undefined);
-  if (!values.length) {
-    host.innerHTML = `<div class="empty">${opts.emptyText || "No data in this window."}</div>`;
-    return;
-  }
+const CLS_STYLE = {
+  returned:   { label: "returned to caller",  colorVar: "--series-1", shape: "circle",  r: 3.5 },
+  near_miss:  { label: "near miss · rejected within 0.15 of the cutoff",
+                                              colorVar: "--series-2", shape: "rect",    r: 3.5 },
+  clear_miss: { label: "genuine miss · scored far below",
+                                              colorVar: "--muted",    shape: "rectRot", r: 4.5 },
+};
+const CLS_ORDER = ["clear_miss", "near_miss", "returned"];
 
-  const yMin = opts.yMin !== undefined ? opts.yMin : 0;
-  let yMax = opts.yMax !== undefined ? opts.yMax : Math.max(...values);
-  if (opts.thresholds) opts.thresholds.forEach(t => { yMax = Math.max(yMax, t.value); });
-  if (yMax <= yMin) yMax = yMin + (opts.fallbackSpan || 1);
-  yMax = opts.niceMax ? opts.niceMax(yMax) : yMax;
+let scatter = null;
 
-  const t0 = opts.t0 !== undefined ? opts.t0 : new Date(points[0].t).getTime();
-  const t1 = opts.t1 !== undefined ? opts.t1 : new Date(points[points.length - 1].t).getTime();
-  const span = Math.max(1, t1 - t0);
-
-  const X = t => pad.l + ((new Date(t).getTime() - t0) / span) * (width - pad.l - pad.r);
-  const Y = v => pad.t + (1 - (v - yMin) / (yMax - yMin)) * (height - pad.t - pad.b);
-
-  const surface = cssVar("--surface");
-  const stroke = cssVar(opts.colorVar || "--series-1");
-  const ticks = opts.yTicks || [yMin, yMin + (yMax - yMin) / 2, yMax];
-
-  let svg = `<svg class="chart" viewBox="0 0 ${width} ${height}" width="${width}" height="${height}" role="img" aria-label="${opts.aria || ""}">`;
-
-  // gridlines: solid hairlines, one step off surface
-  ticks.forEach(v => {
-    const y = Y(v);
-    svg += `<line x1="${pad.l}" y1="${y.toFixed(1)}" x2="${width - pad.r}" y2="${y.toFixed(1)}" stroke="${cssVar("--grid")}" stroke-width="1"/>`;
-    svg += `<text x="${pad.l - 7}" y="${(y + 3.5).toFixed(1)}" text-anchor="end" font-size="10" fill="${cssVar("--muted")}" style="font-variant-numeric:tabular-nums">${opts.fmtY(v)}</text>`;
-  });
-
-  // threshold reference lines (solid hairline + label, never a dashed grid)
-  (opts.thresholds || []).forEach(t => {
-    if (t.value < yMin || t.value > yMax) return;
-    const y = Y(t.value);
-    svg += `<line x1="${pad.l}" y1="${y.toFixed(1)}" x2="${width - pad.r}" y2="${y.toFixed(1)}" stroke="${cssVar(t.colorVar)}" stroke-width="1" opacity=".75"/>`;
-    // labels sit at the left edge: the right edge belongs to the series end-label
-    svg += `<text x="${pad.l + 4}" y="${(y - 4).toFixed(1)}" text-anchor="start" font-size="9" fill="${cssVar(t.colorVar)}" letter-spacing=".04em">${t.label}</text>`;
-  });
-
-  // x axis baseline
-  svg += `<line x1="${pad.l}" y1="${height - pad.b}" x2="${width - pad.r}" y2="${height - pad.b}" stroke="${cssVar("--axis")}" stroke-width="1"/>`;
-
-  // x ticks
-  const tickCount = Math.max(2, Math.min(6, Math.floor(width / 110)));
-  for (let i = 0; i <= tickCount; i++) {
-    const t = t0 + (span * i) / tickCount;
-    svg += `<text x="${X(t).toFixed(1)}" y="${height - 6}" text-anchor="${i === 0 ? "start" : i === tickCount ? "end" : "middle"}" font-size="10" fill="${cssVar("--muted")}" style="font-variant-numeric:tabular-nums">${timeFmt.format(new Date(t))}</text>`;
-  }
-
-  const drawn = points.filter(p => opts.y(p) !== null && opts.y(p) !== undefined);
-  const path = drawn.map((p, i) => `${i ? "L" : "M"}${X(p.t).toFixed(1)},${Y(opts.y(p)).toFixed(1)}`).join("");
-
-  if (drawn.length > 1) {
-    // area wash at ~10% opacity, then the 2px line
-    const area = `M${X(drawn[0].t).toFixed(1)},${(height - pad.b).toFixed(1)}` + path.slice(1) +
-                 `L${X(drawn[drawn.length - 1].t).toFixed(1)},${(height - pad.b).toFixed(1)}Z`;
-    svg += `<path d="${area}" fill="${stroke}" opacity=".10"/>`;
-    svg += `<path d="${path}" fill="none" stroke="${stroke}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>`;
-  }
-
-  // markers: >=8px, 2px surface ring so they stay legible where they overlap
-  drawn.forEach(p => {
-    svg += `<circle cx="${X(p.t).toFixed(1)}" cy="${Y(opts.y(p)).toFixed(1)}" r="4" fill="${stroke}" stroke="${surface}" stroke-width="2"/>`;
-  });
-
-  // end label — selective, only the last point
-  const last = drawn[drawn.length - 1];
-  if (last) {
-    const lx = X(last.t), ly = Y(opts.y(last));
-    const anchor = lx > width - pad.r - 44 ? "end" : "start";
-    svg += `<text x="${(anchor === "end" ? lx - 9 : lx + 9).toFixed(1)}" y="${(ly - 8).toFixed(1)}" text-anchor="${anchor}" font-size="11" fill="${cssVar("--ink")}" style="font-variant-numeric:tabular-nums">${opts.fmtY(opts.y(last))}</text>`;
-  }
-
-  svg += `<rect class="hit" x="${pad.l}" y="0" width="${Math.max(1, width - pad.l - pad.r)}" height="${height}" fill="transparent"/>`;
-  svg += `</svg>`;
-  host.innerHTML = svg;
-
-  // crosshair + nearest-point tooltip
-  const svgEl = host.querySelector("svg");
-  const hit = host.querySelector(".hit");
-  const cross = document.createElementNS("http://www.w3.org/2000/svg", "line");
-  cross.setAttribute("stroke", cssVar("--muted"));
-  cross.setAttribute("stroke-width", "1");
-  cross.setAttribute("opacity", "0");
-  svgEl.insertBefore(cross, hit);
-
-  hit.addEventListener("mousemove", ev => {
-    const box = svgEl.getBoundingClientRect();
-    const px = (ev.clientX - box.left) * (width / box.width);
-    let best = null, bestD = Infinity;
-    drawn.forEach(p => { const d = Math.abs(X(p.t) - px); if (d < bestD) { bestD = d; best = p; } });
-    if (!best) return;
-    cross.setAttribute("x1", X(best.t)); cross.setAttribute("x2", X(best.t));
-    cross.setAttribute("y1", pad.t); cross.setAttribute("y2", height - pad.b);
-    cross.setAttribute("opacity", ".55");
-    showTip(opts.tip(best), ev.clientX, ev.clientY);
-  });
-  hit.addEventListener("mouseleave", () => { cross.setAttribute("opacity", "0"); hideTip(); });
+// Stable per-retrieval jitter. Seeded from the row id rather than Math.random
+// so a point does not hop every 30s refresh, and small enough (<=0.4% of the
+// window) that it never moves a point across a meaningful time boundary. The
+// tooltip always reports the true timestamp.
+function jitter01(id) {
+  let h = 2166136261;
+  for (let i = 0; i < id.length; i++) { h ^= id.charCodeAt(i); h = Math.imul(h, 16777619); }
+  return ((h >>> 0) % 10000) / 10000 - 0.5;
 }
 
-/* ---------- similarity histogram (stacked columns + floor markers) ---------- */
-function histogramChart(host, data, markers) {
-  const width = host.clientWidth || 640;
-  const height = 180;
-  // t leaves a clear band above the tallest bar for the floor-marker labels
-  const pad = { t: 26, r: 14, b: 34, l: 34 };
+// Centred rolling mean over the scored points, in the same unit as the points.
+function rollingMean(pts) {
+  if (pts.length < 4) return [];
+  const k = Math.min(20, Math.max(3, Math.round(pts.length / 6)));
+  const half = Math.floor(k / 2);
+  return pts.map((p, i) => {
+    const lo = Math.max(0, i - half), hi = Math.min(pts.length - 1, i + half);
+    let sum = 0;
+    for (let j = lo; j <= hi; j++) sum += pts[j].top_similarity;
+    return { x: p._x, y: sum / (hi - lo + 1) };
+  });
+}
 
-  const bins = data.histogram;
-  if (!data.samples) {
-    host.innerHTML = `<div class="empty">No scored retrievals in the last ${data.hours}h — nothing to calibrate against.</div>`;
+/* Band, cutoff line and the single end-of-series callout. Drawn as a plugin so
+   they live on the same scale as the data and cannot drift out of sync. */
+const floorPlugin = {
+  id: "floorBand",
+  beforeDatasetsDraw(chart, _args, opts) {
+    if (opts.floor === null || opts.floor === undefined) return;
+    const { ctx, chartArea: { left, right }, scales: { y } } = chart;
+    const top = y.getPixelForValue(opts.floor);
+    const bottom = y.getPixelForValue(Math.max(y.min, opts.floor - opts.band));
+    ctx.save();
+    ctx.globalAlpha = 0.08;
+    ctx.fillStyle = opts.bandColor;
+    ctx.fillRect(left, top, right - left, bottom - top);
+    ctx.restore();
+  },
+  afterDatasetsDraw(chart, _args, opts) {
+    const { ctx, chartArea: { left, right, top: areaTop }, scales: { y } } = chart;
+    ctx.save();
+    if (opts.floor !== null && opts.floor !== undefined) {
+      const yPx = y.getPixelForValue(opts.floor);
+      ctx.setLineDash([5, 4]);
+      ctx.strokeStyle = opts.lineColor;
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.moveTo(left, yPx);
+      ctx.lineTo(right, yPx);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle = opts.lineColor;
+      ctx.font = `10px ${opts.mono}`;
+      ctx.textAlign = "left";
+      ctx.textBaseline = "bottom";
+      ctx.fillText(opts.floorLabel, left + 4, yPx - 4);
+    }
+    if (opts.callout) {
+      ctx.font = `600 11px ${opts.sans}`;
+      ctx.textAlign = "right";
+      ctx.textBaseline = "top";
+      const w = ctx.measureText(opts.callout).width;
+      const x = right - 4, yTxt = areaTop + 4;
+      ctx.fillStyle = opts.surface;
+      ctx.globalAlpha = 0.85;
+      ctx.fillRect(x - w - 6, yTxt - 3, w + 10, 18);
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = opts.calloutColor;
+      ctx.fillText(opts.callout, x, yTxt);
+    }
+    ctx.restore();
+  },
+};
+
+function renderScatter(data, floor) {
+  const host = document.querySelector(".canvas-wrap");
+  const empty = `No retrievals in the last ${data.hours}h. This panel needs recall() traffic — an empty window is not the same as a healthy one.`;
+
+  if (typeof Chart === "undefined") {
+    host.innerHTML = `<div class="empty">Chart library did not load — the numbers above are still live.</div>`;
+    return;
+  }
+  if (!data.points.length) {
+    if (scatter) { scatter.destroy(); scatter = null; }
+    host.innerHTML = `<div class="empty">${empty}</div>`;
+    return;
+  }
+  if (!host.querySelector("canvas")) {
+    host.innerHTML = `<canvas id="chartScatter"></canvas>`;
+  }
+
+  const t1 = Date.now();
+  const t0 = t1 - data.hours * 3600 * 1000;
+  const jitterMs = (t1 - t0) * 0.004;
+
+  const pts = data.points
+    .map(p => ({ ...p, _t: new Date(p.t).getTime() }))
+    .sort((a, b) => a._t - b._t)
+    .map(p => ({ ...p, _x: p._t + jitter01(p.id) * 2 * jitterMs }));
+
+  const dataMax = Math.max(...pts.map(p => p.top_similarity));
+  const yMax = Math.min(1, Math.max(0.85, Math.ceil((dataMax + 0.05) * 20) / 20));
+
+  const datasets = CLS_ORDER.filter(cls => pts.some(p => p.cls === cls)).map(cls => {
+    const style = CLS_STYLE[cls];
+    return {
+      label: style.label,
+      data: pts.filter(p => p.cls === cls).map(p => ({ x: p._x, y: p.top_similarity, p })),
+      backgroundColor: cssVar(style.colorVar),
+      borderColor: cssVar(style.colorVar),
+      pointStyle: style.shape,
+      pointRadius: style.r,
+      pointHoverRadius: style.r + 2.5,
+      showLine: false,
+    };
+  });
+
+  const roll = rollingMean(pts);
+  if (roll.length) {
+    datasets.push({
+      label: `rolling avg similarity (${Math.min(20, Math.max(3, Math.round(pts.length / 6)))}-pt)`,
+      data: roll,
+      borderColor: cssVar("--ink-2"),
+      backgroundColor: "transparent",
+      borderWidth: 2,
+      pointRadius: 0,
+      pointHitRadius: 0,
+      showLine: true,
+      tension: 0.3,
+      order: -1,
+    });
+  }
+
+  const floored = data.counts.near_miss + data.counts.clear_miss;
+  const pluginOpts = {
+    floor,
+    band: data.band,
+    floorLabel: `cutoff ${floor}`,
+    callout: `${floored} floored · ${data.counts.near_miss} near-miss`,
+    bandColor: cssVar("--warn"),
+    lineColor: cssVar("--warn"),
+    calloutColor: cssVar("--ink"),
+    surface: cssVar("--surface"),
+    mono: "ui-monospace, SFMono-Regular, Menlo, monospace",
+    sans: "system-ui, -apple-system, sans-serif",
+  };
+
+  if (scatter) {
+    scatter.data.datasets = datasets;
+    scatter.options.scales.x.min = t0;
+    scatter.options.scales.x.max = t1;
+    scatter.options.scales.y.max = yMax;
+    scatter.options.plugins.floorBand = pluginOpts;
+    scatter.update("none");
     return;
   }
 
-  const maxCount = Math.max(1, ...bins.map(b => b.kept + b.rejected));
+  scatter = new Chart(host.querySelector("canvas"), {
+    type: "scatter",
+    data: { datasets },
+    plugins: [floorPlugin],
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      animation: false,
+      parsing: false,
+      interaction: { mode: "nearest", intersect: true },
+      layout: { padding: { top: 4, right: 2 } },
+      scales: {
+        x: {
+          type: "linear", min: t0, max: t1,
+          grid: { color: cssVar("--grid"), drawTicks: false },
+          border: { color: cssVar("--axis") },
+          ticks: {
+            color: cssVar("--muted"), font: { size: 10 }, maxRotation: 0, autoSkipPadding: 24,
+            callback: v => timeFmt.format(new Date(v)),
+          },
+        },
+        y: {
+          type: "linear", min: 0, max: yMax,
+          title: { display: true, text: "cosine similarity", color: cssVar("--muted"), font: { size: 10 } },
+          grid: { color: cssVar("--grid"), drawTicks: false },
+          border: { color: cssVar("--axis") },
+          ticks: { color: cssVar("--muted"), font: { size: 10 }, stepSize: 0.2, callback: v => v.toFixed(2) },
+        },
+      },
+      plugins: {
+        floorBand: pluginOpts,
+        legend: {
+          position: "top", align: "start",
+          labels: {
+            usePointStyle: true, boxWidth: 8, boxHeight: 8, padding: 14,
+            color: cssVar("--ink-2"), font: { size: 11 },
+          },
+        },
+        tooltip: {
+          backgroundColor: "#000",
+          borderColor: cssVar("--border"), borderWidth: 1,
+          titleColor: cssVar("--muted"), titleFont: { size: 10, weight: "600" },
+          bodyColor: cssVar("--ink"), bodyFont: { size: 11 },
+          padding: 8, displayColors: false,
+          callbacks: {
+            // The tooltip carries the true timestamp because the x position is
+            // jittered; and the query text, because the claim this panel makes
+            // is that these are real retrievals, not a synthetic cloud.
+            title: items => {
+              const p = items[0].raw.p;
+              return p ? dateTimeFmt.format(new Date(p.t)) : "";
+            },
+            label: item => {
+              const p = item.raw.p;
+              if (!p) return `rolling avg ${item.parsed.y.toFixed(4)}`;
+              const out = [`score ${p.top_similarity.toFixed(4)}`];
+              out.push(p.short_by !== null && p.short_by !== undefined
+                ? `short by ${p.short_by.toFixed(4)} (cutoff ${p.applied_floor})`
+                : `cleared the cutoff (${p.applied_floor})`);
+              out.push(`${p.raw_candidates ?? "—"} candidates · ${p.results_returned} returned`);
+              const q = p.query_text || "";
+              out.push(`"${q.length > 40 ? q.slice(0, 40) + "…" : q}"`);
+              return out;
+            },
+          },
+        },
+      },
+    },
+  });
+}
+
+/* ---------- similarity histogram (regions + floor markers) ----------
+   Bins are built here from the individual scores rather than taken from a
+   pre-binned feed, because a bar's colour has to be a FUNCTION of its score
+   against the applied floor, not a separate field that could disagree with it.
+
+   The grid is split at the floor: [0, floor] and [floor, 1] each get their own
+   uniform bin width, so the cutoff is always exactly a bin edge and no bin can
+   straddle it. That makes "an orange rejected bar sitting to the right of the
+   gold cutoff" -- a contradiction, since nothing at or above the floor was
+   rejected -- something this renderer cannot draw, rather than something we
+   check for after the fact. */
+
+function buildBins(scores, floor, target) {
+  const nL = Math.max(1, Math.round(floor / target));
+  const nR = Math.max(1, Math.round((1 - floor) / target));
+  const wL = floor / nL, wR = (1 - floor) / nR;
+  const bins = [];
+  for (let i = 0; i < nL; i++) bins.push({ lo: i * wL, hi: (i + 1) * wL, n: 0, side: "rejected" });
+  for (let i = 0; i < nR; i++) bins.push({ lo: floor + i * wR, hi: floor + (i + 1) * wR, n: 0, side: "returned" });
+  scores.forEach(sc => {
+    const idx = sc < floor
+      ? Math.min(nL - 1, Math.max(0, Math.floor(sc / wL)))
+      : nL + Math.min(nR - 1, Math.max(0, Math.floor((sc - floor) / wR)));
+    bins[idx].n++;
+  });
+  return { bins, splitIndex: nL };
+}
+
+/* Where the cutoff should sit. The check's suggested_floor is authoritative
+   when it produced one. When it did not -- its window is 60m while this chart
+   is 24h, so the common case is a quiet check and a populated chart -- fall
+   back to the widest empty valley among the discarded scores and say so. The
+   search is restricted to below the floor on purpose: the largest gap in the
+   whole distribution is the one between rejected and returned, and a marker
+   there would read as "raise the floor", the opposite of the finding. */
+function idealZone(scores, floor, suggested) {
+  if (suggested !== null && suggested !== undefined) {
+    return { value: suggested, source: "check" };
+  }
+  const below = scores.filter(sc => sc < floor).sort((a, b) => a - b);
+  if (below.length < 2) return null;
+  let best = null;
+  for (let i = 1; i < below.length; i++) {
+    const gap = below[i] - below[i - 1];
+    if (!best || gap > best.gap) best = { gap, lo: below[i - 1], hi: below[i] };
+  }
+  if (!best || best.gap < 0.03) return null;
+  return { value: Math.round(((best.lo + best.hi) / 2) * 10000) / 10000, source: "valley" };
+}
+
+// Rough advance width for the 10px label font; used to hide a region label
+// rather than let it clip or overlap its neighbour on a narrow viewport.
+function fitsWidth(text, px) { return text.length * 5.4 <= px - 10; }
+
+function histogramChart(host, points, floor, suggested, hours) {
+  const width = host.clientWidth || 640;
+  const height = 200;
+  // t carries the two region labels above the tallest bar; b carries the axis,
+  // its title, and the "ideal zone" label, which sits low so it cannot collide.
+  const pad = { t: 34, r: 14, b: 46, l: 34 };
+
+  if (!points) {
+    host.innerHTML = `<div class="empty">Score data unavailable — this panel needs the retrievals feed.</div>`;
+    return;
+  }
+  const scores = points.points.map(p => p.top_similarity);
+  if (!scores.length) {
+    host.innerHTML = `<div class="empty">No scored retrievals in the last ${hours}h — nothing to calibrate against.</div>`;
+    return;
+  }
+
+  const { bins, splitIndex } = buildBins(scores, floor, 1 / 26);
+  const maxCount = Math.max(1, ...bins.map(b => b.n));
   const plotW = width - pad.l - pad.r;
   const plotH = height - pad.t - pad.b;
-  const X = s => pad.l + s * plotW;                    // similarity 0..1
-  const Y = c => pad.t + (1 - c / maxCount) * plotH;
+  const X = v => pad.l + v * plotW;
+  const Y = c => pad.t + (1 - c / maxCount) * plotH;   // tight: tallest bar meets pad.t
 
-  const surface = cssVar("--surface");
-  const kept = cssVar("--series-1");
-  const rejected = cssVar("--series-2");
-  const GAP = 2;
+  const grid = cssVar("--grid");
+  const muted = cssVar("--muted");
+  const gold = cssVar("--warn");
+  const green = cssVar("--good");
+  const blue = cssVar("--series-1");
+  const orange = cssVar("--series-2");
+  const ideal = idealZone(scores, floor, suggested);
 
-  let svg = `<svg class="chart" viewBox="0 0 ${width} ${height}" width="${width}" height="${height}" role="img" aria-label="Distribution of top similarity scores with the applied floor marked">`;
+  let svg = `<svg class="chart" viewBox="0 0 ${width} ${height}" width="${width}" height="${height}" role="img" aria-label="Distribution of top similarity scores. ${scores.length} retrievals, cutoff at ${floor}${ideal ? `, ideal zone near ${ideal.value}` : ""}.">`;
 
-  [0, Math.round(maxCount / 2), maxCount].forEach(c => {
+  // region washes -- the cutoff splits the axis into a discarded half and a
+  // returned half. Grey on the left, not orange: most of that region is the
+  // system correctly rejecting off-topic queries, which is not a problem.
+  svg += `<rect x="${X(0)}" y="${pad.t}" width="${(X(floor) - X(0)).toFixed(1)}" height="${plotH}" fill="${muted}" opacity=".13"/>`;
+  svg += `<rect x="${X(floor)}" y="${pad.t}" width="${(X(1) - X(floor)).toFixed(1)}" height="${plotH}" fill="${blue}" opacity=".09"/>`;
+
+  const yTicks = [...new Set([0, Math.round(maxCount / 2), maxCount])];
+  yTicks.forEach(c => {
     const y = Y(c);
-    svg += `<line x1="${pad.l}" y1="${y.toFixed(1)}" x2="${width - pad.r}" y2="${y.toFixed(1)}" stroke="${cssVar("--grid")}" stroke-width="1"/>`;
-    svg += `<text x="${pad.l - 6}" y="${(y + 3.5).toFixed(1)}" text-anchor="end" font-size="10" fill="${cssVar("--muted")}" style="font-variant-numeric:tabular-nums">${c}</text>`;
+    svg += `<line x1="${pad.l}" y1="${y.toFixed(1)}" x2="${width - pad.r}" y2="${y.toFixed(1)}" stroke="${grid}" stroke-width="1"/>`;
+    svg += `<text x="${pad.l - 6}" y="${(y + 3.5).toFixed(1)}" text-anchor="end" font-size="10" fill="${muted}" style="font-variant-numeric:tabular-nums">${c}</text>`;
   });
 
-  const slot = plotW / bins.length;
-  const barW = Math.max(2, Math.min(24, slot - GAP));
+  // region labels: inside the plot area, centred in each half, in the band
+  // above the tallest bar. Hidden rather than clipped when the half is narrow.
+  const halves = [
+    { text: "discarded", x0: X(0), x1: X(floor), fill: muted },
+    { text: "returned to agent", x0: X(floor), x1: X(1), fill: blue },
+  ];
+  halves.forEach(h => {
+    const w = h.x1 - h.x0;
+    if (!fitsWidth(h.text, w)) return;
+    svg += `<text x="${(h.x0 + w / 2).toFixed(1)}" y="${pad.t - 12}" text-anchor="middle" font-size="10" fill="${h.fill}" letter-spacing=".06em" style="text-transform:uppercase">${h.text}</text>`;
+  });
+
   bins.forEach(b => {
-    const total = b.kept + b.rejected;
-    if (!total) return;
-    const x = X(b.lo) + (slot - barW) / 2;
-    const base = Y(0);
-    // rejected sits at the baseline, kept stacks above, 2px surface gap between
-    let cursor = base;
-    const segs = [
-      { n: b.rejected, fill: rejected },
-      { n: b.kept, fill: kept },
-    ].filter(s => s.n > 0);
-    segs.forEach((seg, i) => {
-      const h = (seg.n / maxCount) * plotH;
-      const top = cursor - h;
-      const isTop = i === segs.length - 1;
-      const r = isTop ? Math.min(4, h / 2, barW / 2) : 0;
-      const y = top + (i > 0 ? GAP / 2 : 0);
-      const hh = Math.max(1, h - (i > 0 ? GAP / 2 : 0));
-      svg += `<path d="M${x},${(y + r).toFixed(1)} a${r},${r} 0 0 1 ${r},${-r} h${(barW - 2 * r).toFixed(1)} a${r},${r} 0 0 1 ${r},${r} v${(hh - r).toFixed(1)} h${-barW} Z" fill="${seg.fill}"/>`;
-      cursor = top;
-    });
+    if (!b.n) return;
+    const x0 = X(b.lo), x1 = X(b.hi);
+    const w = Math.max(1.5, x1 - x0 - 2);
+    const h = (b.n / maxCount) * plotH;
+    const y = Y(b.n);
+    const r = Math.min(3, w / 2, h / 2);
+    // colour is derived from the bin's side of the floor, and the grid
+    // guarantees the side is unambiguous
+    const fill = b.side === "rejected" ? orange : blue;
+    svg += `<path d="M${(x0 + 1).toFixed(1)},${(y + r).toFixed(1)} a${r},${r} 0 0 1 ${r},${-r} h${(w - 2 * r).toFixed(1)} a${r},${r} 0 0 1 ${r},${r} v${(h - r).toFixed(1)} h${(-w).toFixed(1)} Z" fill="${fill}"/>`;
   });
 
-  // baseline
   svg += `<line x1="${pad.l}" y1="${Y(0)}" x2="${width - pad.r}" y2="${Y(0)}" stroke="${cssVar("--axis")}" stroke-width="1"/>`;
 
-  [0, 0.25, 0.5, 0.75, 1].forEach(s => {
-    svg += `<text x="${X(s).toFixed(1)}" y="${height - 16}" text-anchor="middle" font-size="10" fill="${cssVar("--muted")}" style="font-variant-numeric:tabular-nums">${s.toFixed(2)}</text>`;
+  [0, 0.25, 0.5, 0.75, 1].forEach(v => {
+    svg += `<text x="${X(v).toFixed(1)}" y="${height - 28}" text-anchor="middle" font-size="10" fill="${muted}" style="font-variant-numeric:tabular-nums">${v.toFixed(2)}</text>`;
   });
-  svg += `<text x="${(pad.l + plotW / 2).toFixed(1)}" y="${height - 3}" text-anchor="middle" font-size="10" fill="${cssVar("--muted")}">cosine similarity</text>`;
+  svg += `<text x="${(pad.l + plotW / 2).toFixed(1)}" y="${height - 14}" text-anchor="middle" font-size="10" fill="${muted}">cosine similarity</text>`;
 
-  // vertical floor markers, labelled -- these are the whole point of the chart
-  markers.filter(m => m.value !== null && m.value !== undefined).forEach(m => {
-    const x = X(m.value);
-    svg += `<line x1="${x.toFixed(1)}" y1="${pad.t - 8}" x2="${x.toFixed(1)}" y2="${Y(0)}" stroke="${cssVar(m.colorVar)}" stroke-width="2"/>`;
+  // the ideal zone: dashed green, labelled low so it clears the bars and the
+  // region labels at every width
+  if (ideal) {
+    const x = X(ideal.value);
+    svg += `<line x1="${x.toFixed(1)}" y1="${pad.t}" x2="${x.toFixed(1)}" y2="${Y(0)}" stroke="${green}" stroke-width="2" stroke-dasharray="5 4"/>`;
     const anchor = x > width - 90 ? "end" : "start";
     const tx = anchor === "end" ? x - 5 : x + 5;
-    svg += `<text x="${tx.toFixed(1)}" y="11" text-anchor="${anchor}" font-size="10" fill="${cssVar(m.colorVar)}" style="font-variant-numeric:tabular-nums">${m.label}</text>`;
-  });
+    // the label sits low, where bars are widest, so it carries its own plate --
+    // a bar behind it would otherwise eat the text at some window widths
+    const label = `ideal zone ${ideal.value}`;
+    const lw = label.length * 5.6 + 8;
+    const ly = Y(0) - 15;
+    svg += `<rect x="${(anchor === "end" ? tx - lw + 4 : tx - 4).toFixed(1)}" y="${ly.toFixed(1)}" width="${lw.toFixed(1)}" height="14" rx="2" fill="${cssVar("--surface")}" opacity=".92"/>`;
+    svg += `<text x="${tx.toFixed(1)}" y="${(ly + 10.5).toFixed(1)}" text-anchor="${anchor}" font-size="10" fill="${green}" style="font-variant-numeric:tabular-nums">${label}</text>`;
+  }
+
+  // the cutoff: the most prominent mark on the chart, and exactly on a bin edge
+  const xf = X(floor);
+  svg += `<line x1="${xf.toFixed(1)}" y1="${pad.t - 6}" x2="${xf.toFixed(1)}" y2="${Y(0)}" stroke="${gold}" stroke-width="3"/>`;
+  const fAnchor = xf > width - 90 ? "end" : "start";
+  svg += `<text x="${(fAnchor === "end" ? xf - 6 : xf + 6).toFixed(1)}" y="${(pad.t - 12).toFixed(1)}" text-anchor="${fAnchor}" font-size="11" font-weight="600" fill="${gold}" style="font-variant-numeric:tabular-nums">cutoff ${floor}</text>`;
 
   svg += `</svg>`;
   host.innerHTML = svg;
 
-  // per-bin hover
   const svgEl = host.querySelector("svg");
   const hit = document.createElementNS("http://www.w3.org/2000/svg", "rect");
-  hit.setAttribute("x", pad.l); hit.setAttribute("y", 0);
-  hit.setAttribute("width", Math.max(1, plotW)); hit.setAttribute("height", height);
+  hit.setAttribute("x", pad.l); hit.setAttribute("y", pad.t);
+  hit.setAttribute("width", Math.max(1, plotW)); hit.setAttribute("height", plotH);
   hit.setAttribute("fill", "transparent");
   svgEl.appendChild(hit);
   hit.addEventListener("mousemove", ev => {
     const box = svgEl.getBoundingClientRect();
     const px = (ev.clientX - box.left) * (width / box.width);
-    const idx = Math.max(0, Math.min(bins.length - 1, Math.floor((px - pad.l) / slot)));
-    const b = bins[idx];
+    const v = Math.max(0, Math.min(1, (px - pad.l) / plotW));
+    const b = bins.find(bin => v >= bin.lo && v < bin.hi) || bins[bins.length - 1];
     showTip(
-      `<div class="t-h">similarity ${b.lo.toFixed(2)} – ${b.hi.toFixed(2)}</div>
-       <div class="t-r"><span>returned</span><span>${b.kept}</span></div>
-       <div class="t-r"><span>rejected</span><span>${b.rejected}</span></div>`,
+      `<div class="t-h">similarity ${b.lo.toFixed(3)} – ${b.hi.toFixed(3)}</div>
+       <div class="t-r"><span>retrievals</span><span>${b.n}</span></div>
+       <div class="t-r"><span>outcome</span><span>${b.side === "rejected" ? "discarded" : "returned"}</span></div>`,
       ev.clientX, ev.clientY);
   });
   hit.addEventListener("mouseleave", hideTip);
 }
 
-function renderCalibration(sim, current) {
+function renderCalibration(sim, current, points) {
   const check = (current.checks || []).find(c => c.check_name === "near_miss") || {};
   const status = check.status || "unknown";
   const nm = sim.near_miss || {};
   const floors = sim.floors_in_force.length ? sim.floors_in_force : [sim.default_floor];
+  const floor = floors[floors.length - 1];
   const suggested = nm.suggested_floor;
 
   const chip = $("calibChip");
@@ -870,12 +1095,12 @@ function renderCalibration(sim, current) {
 
   $("calibFloor").textContent = floors.map(f => f.toFixed(4).replace(/0+$/, "").replace(/\.$/, "")).join(" · ");
   $("calibCount").textContent = nm.near_miss ?? "—";
-  $("calibShare").textContent =
-    nm.near_miss_pct_of_floored !== null && nm.near_miss_pct_of_floored !== undefined
-      ? `${nm.near_miss_pct_of_floored}% of ${nm.floored_out_total}` : "—";
+  $("calibShare").textContent = nm.floored_out_total
+    ? `${nm.near_miss_pct_of_floored}% of ${nm.floored_out_total}`
+    : "—";
 
   if (suggested !== null && suggested !== undefined) {
-    const delta = (suggested - floors[floors.length - 1]).toFixed(4);
+    const delta = (suggested - floor).toFixed(4);
     $("calibSuggested").textContent = `${suggested}  (${delta})`;
   } else {
     $("calibSuggested").textContent = "—";
@@ -901,14 +1126,16 @@ function renderCalibration(sim, current) {
         : `${nm.suggestion_basis || ""}`);
   }
 
-  histogramChart($("chartHist"), sim, [
-    {
-      value: floors[floors.length - 1],
-      colorVar: status === "critical" ? "--critical" : status === "warn" ? "--warn" : "--muted",
-      label: `floor ${floors[floors.length - 1]}`,
-    },
-    { value: suggested, colorVar: "--good", label: `suggested ${suggested}` },
-  ]);
+  histogramChart($("chartHist"), points, floor, suggested, sim.hours);
+
+  const zone = points && points.points.length
+    ? idealZone(points.points.map(p => p.top_similarity), floor, suggested)
+    : null;
+  $("calibZoneNote").textContent = !zone
+    ? ""
+    : zone.source === "check"
+      ? `Ideal zone ${zone.value} is the check's suggested floor. The gap to the cutoff at ${floor} is the mis-calibration.`
+      : `Ideal zone ${zone.value} is the midpoint of the empty valley between the discarded clusters in this 24h window — derived from the chart, not the checker's verdict.`;
 
   const examples = nm.examples || [];
   $("calibExamples").innerHTML = examples.length
@@ -1005,50 +1232,26 @@ function renderOverall(current, stats) {
   $("factRows").textContent = stats ? fmt(stats.total_rows) : "—";
 }
 
-function renderDegradation(deg) {
+function renderDegradation(deg, points) {
   $("degRate").textContent = deg.totals.retrievals ? `${deg.totals.floored_rate}%` : "—";
   $("degTotal").textContent = fmt(deg.totals.retrievals);
   $("degFloored").textContent = fmt(deg.totals.floored_out);
-  $("degFloor").textContent = deg.min_similarity;
 
-  const t0 = Date.now() - deg.hours * 3600 * 1000;
-  const t1 = Date.now();
-  const empty = `No retrievals in the last ${deg.hours}h. This panel needs recall() traffic — an empty window is not the same as a healthy one.`;
+  if (points) {
+    $("degAvgSim").textContent = points.avg_top_similarity ?? "—";
 
-  lineChart($("chartRate"), deg.points, {
-    y: p => p.floored_rate,
-    yMin: 0, yMax: 100, niceMax: () => 100,
-    yTicks: [0, 50, 100],
-    t0, t1,
-    fmtY: v => `${Math.round(v)}%`,
-    colorVar: "--series-1",
-    emptyText: empty,
-    aria: "Floored-out rate over time",
-    thresholds: [
-      { value: deg.warn_pct, colorVar: "--warn", label: `warn ${deg.warn_pct}%` },
-      { value: deg.critical_pct, colorVar: "--critical", label: `critical ${deg.critical_pct}%` },
-    ],
-    tip: p => `<div class="t-h">${dateTimeFmt.format(new Date(p.t))}</div>
-      <div class="t-r"><span>floored-out rate</span><span>${p.floored_rate}%</span></div>
-      <div class="t-r"><span>floored / total</span><span>${p.floored_out} / ${p.retrievals}</span></div>
-      <div class="t-r"><span>avg top similarity</span><span>${p.avg_top_similarity ?? "—"}</span></div>`,
-  });
+    // One floor is the normal case; if agents disagree, the chart draws the
+    // last one and the note says so rather than implying a single policy.
+    const floors = points.floors_in_force.length ? points.floors_in_force : [points.default_floor];
+    const floor = floors[floors.length - 1];
+    renderScatter(points, floor);
 
-  lineChart($("chartSim"), deg.points, {
-    y: p => p.avg_top_similarity,
-    yMin: 0, yMax: 1,
-    yTicks: [0, 0.5, 1],
-    t0, t1, height: 112,
-    fmtY: v => v.toFixed(2),
-    colorVar: "--series-2",
-    emptyText: empty,
-    aria: "Average top similarity over time",
-    thresholds: [{ value: deg.min_similarity, colorVar: "--warn", label: `floor ${deg.min_similarity}` }],
-    tip: p => `<div class="t-h">${dateTimeFmt.format(new Date(p.t))}</div>
-      <div class="t-r"><span>avg top similarity</span><span>${p.avg_top_similarity ?? "—"}</span></div>
-      <div class="t-r"><span>retrievals</span><span>${p.retrievals}</span></div>
-      <div class="t-r"><span>avg latency</span><span>${p.avg_latency_ms ?? "—"} ms</span></div>`,
-  });
+    const notes = [];
+    if (floors.length > 1) notes.push(`${floors.length} floors in force (${floors.join(" · ")}) — cutoff drawn at ${floor}`);
+    if (points.unscored) notes.push(`${fmt(points.unscored)} retrieval${points.unscored === 1 ? "" : "s"} found no candidates at all, so ${points.unscored === 1 ? "it has" : "they have"} no score to plot — see Agent impact`);
+    if (points.truncated) notes.push(`showing the first ${fmt(points.scored)} scored retrievals in the window`);
+    $("scatterNote").textContent = notes.join(" · ");
+  }
 
   $("degTableBody").innerHTML = deg.points.length
     ? deg.points.map(p => `<tr>
@@ -1153,6 +1356,7 @@ const FEEDS = [
   { key: "history", url: "/api/health/history?hours=24&buckets=48" },
   { key: "stats",   url: "/api/memory/stats",                       card: "cardCorpus" },
   { key: "deg",     url: "/api/retrievals/degradation?hours=24",        card: "cardDegradation" },
+  { key: "points",  url: "/api/retrievals/points?hours=24",             cards: ["cardDegradation", "cardCalibration"] },
   { key: "recent",  url: "/api/retrievals/recent?limit=50",             card: "cardRetrievals" },
   { key: "sim",     url: "/api/retrievals/similarity?hours=24&bins=28", card: "cardCalibration" },
   { key: "impact",  url: "/api/agent/impact?hours=24&limit=25",         card: "cardImpact" },
@@ -1170,18 +1374,20 @@ async function refresh() {
     const failed = [];
     settled.forEach((result, i) => {
       const feed = FEEDS[i];
+      const cards = feed.cards || (feed.card ? [feed.card] : []);
       if (result.status === "fulfilled") {
         data[feed.key] = result.value;
-        if (feed.card) setStale(feed.card, false);
+        cards.forEach(c => setStale(c, false));
       } else {
         failed.push(feed.key);
-        if (feed.card) setStale(feed.card, true);
+        cards.forEach(c => setStale(c, true));
         console.error(feed.url, result.reason);
       }
     });
 
     if (data.history) cache.history = data.history;
     if (data.deg) cache.degradation = data.deg;
+    if (data.points) cache.points = data.points;
     if (data.sim) cache.similarity = data.sim;
     if (data.current) cache.current = data.current;
 
@@ -1192,8 +1398,8 @@ async function refresh() {
     } else {
       renderOverallUnreachable("health endpoint did not respond — this is not a healthy state");
     }
-    if (data.deg) renderDegradation(data.deg);
-    if (data.sim && (data.current || cache.current)) renderCalibration(data.sim, data.current || cache.current);
+    if (data.deg) renderDegradation(data.deg, data.points || cache.points);
+    if (data.sim && (data.current || cache.current)) renderCalibration(data.sim, data.current || cache.current, data.points || cache.points);
     if (data.impact) renderImpact(data.impact);
     if (data.stats) renderStats(data.stats);
     if (data.recent) renderRetrievals(data.recent);
@@ -1230,7 +1436,7 @@ $("btnChart").addEventListener("click", () => {
   $("degTableView").style.display = "none";
   $("btnChart").setAttribute("aria-pressed", "true");
   $("btnTable").setAttribute("aria-pressed", "false");
-  if (cache.degradation) renderDegradation(cache.degradation);
+  if (cache.degradation) renderDegradation(cache.degradation, cache.points);
 });
 $("btnTable").addEventListener("click", () => {
   $("degChartView").style.display = "none";
@@ -1243,8 +1449,7 @@ let resizeTimer;
 addEventListener("resize", () => {
   clearTimeout(resizeTimer);
   resizeTimer = setTimeout(() => {
-    if (cache.degradation) renderDegradation(cache.degradation);
-    if (cache.similarity && cache.current) renderCalibration(cache.similarity, cache.current);
+    if (cache.similarity && cache.current) renderCalibration(cache.similarity, cache.current, cache.points);
   }, 140);
 });
 
